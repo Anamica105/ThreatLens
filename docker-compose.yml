@@ -1,0 +1,35 @@
+# Production-style stack: PostgreSQL + API + web.
+#   docker compose up --build        then open http://localhost:3000
+# Put secrets (ANTHROPIC_API_KEY, BRAVE_SEARCH_API_KEY, OSINT keys) in api/.env.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: threatlens
+      POSTGRES_PASSWORD: threatlens
+      POSTGRES_DB: threatlens
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threatlens"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./api
+    env_file: [./api/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://threatlens:threatlens@db:5432/threatlens
+      WEB_BASE_URL: http://localhost:3000
+    volumes: [apidata:/app/data]
+    depends_on:
+      db: { condition: service_healthy }
+    ports: ["8000:8000"]
+
+  web:
+    build: ./web
+    depends_on: [api]
+    ports: ["3000:3000"]
+
+volumes:
+  pgdata:
+  apidata:

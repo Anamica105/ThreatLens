@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ r.id }} — {{ rec.title }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Mono:wght@400;600&family=Atkinson+Hyperlegible+Next:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root { --g-25:#F7F8FA; --g-50:#F0F2F5; --g-100:#E3E6EB; --g-200:#CDD2DA; --g-500:#6A7384; --g-600:#525B6B; --g-700:#3D4452; --g-800:#2A303B; --g-900:#181C23; --uv-600:#5249A8; --uv-700:#433B8E; }
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Atkinson Hyperlegible Next", "Segoe UI", system-ui, sans-serif; color: var(--g-900); font-size: 10.5pt; line-height: 15pt; margin: 0; background: #fff; }
+  .mono, code, pre { font-family: "Atkinson Hyperlegible Mono", "Cascadia Mono", Consolas, monospace; }
+  h1 { font-size: 24pt; line-height: 30pt; margin: 0 0 10pt; letter-spacing: -0.005em; font-weight: 700; }
+  h2 { font-size: 16pt; line-height: 21pt; margin: 22pt 0 8pt; font-weight: 600; break-after: avoid; }
+  h3 { font-size: 13pt; line-height: 18pt; margin: 14pt 0 6pt; font-weight: 600; break-after: avoid; }
+  h4 { font-size: 11pt; margin: 10pt 0 4pt; font-weight: 600; }
+  p { margin: 0 0 8pt; }
+  a { color: var(--uv-700); }
+  .muted { color: var(--g-500); }
+  .cover { border-left: 4px solid {{ sev.solid }}; padding: 4pt 0 4pt 14pt; margin-bottom: 18pt; break-after: page; }
+  .badges { display: flex; gap: 6pt; flex-wrap: wrap; margin: 6pt 0 14pt; }
+  .badge { display: inline-flex; align-items: center; gap: 5pt; font-size: 9pt; font-weight: 600; padding: 2pt 7pt; border-radius: 3pt; background: var(--g-50); color: var(--g-800); }
+  .sq { width: 7pt; height: 7pt; display: inline-block; border-radius: 1pt; }
+  .rail { display: grid; grid-template-columns: repeat(14, 1fr); gap: 2pt; margin: 10pt 0 2pt; }
+  .rail div { height: 8pt; border-radius: 1pt; }
+  .rail-labels { display: grid; grid-template-columns: repeat(14, 1fr); gap: 2pt; font-size: 6.5pt; color: var(--g-500); text-align: center; margin-bottom: 12pt; }
+  table { width: 100%; border-collapse: collapse; font-size: 9pt; line-height: 12pt; margin: 4pt 0 10pt; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; }
+  th { text-align: left; background: var(--g-25); color: var(--g-600); font-weight: 600; border-bottom: 1px solid var(--g-200); padding: 4pt 6pt; }
+  td { border-bottom: 1px solid var(--g-100); padding: 4pt 6pt; vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .quote { font-style: italic; color: var(--g-700); }
+  .callout { border: 1px solid #E2C993; background: #FFF4DB; border-radius: 6pt; padding: 8pt 10pt; margin: 8pt 0; break-inside: avoid; }
+  .result { border-radius: 6pt; padding: 8pt 10pt; margin: 6pt 0 10pt; background: {{ result_style.soft }}; }
+  .result b { color: {{ result_style.text }}; }
+  pre { background: var(--g-25); border: 1px solid var(--g-100); border-radius: 6pt; padding: 7pt 9pt; font-size: 8pt; line-height: 11pt; white-space: pre-wrap; word-break: break-all; margin: 4pt 0 8pt; break-inside: avoid; }
+  .kv { display: grid; grid-template-columns: 110pt 1fr; gap: 3pt 10pt; font-size: 9.5pt; }
+  .kv div:nth-child(odd) { color: var(--g-500); }
+  ul { margin: 0 0 8pt; padding-left: 16pt; }
+  li { margin-bottom: 3pt; }
+  .appendix { break-before: page; }
+  .flag { color: #8F5A00; font-weight: 600; }
+  .demo { font-size: 8.5pt; color: var(--g-600); border: 1px solid var(--g-100); border-radius: 6pt; padding: 6pt 8pt; margin-top: 10pt; }
+</style>
+</head>
+<body>
+<section class="cover">
+  <div class="muted mono" style="font-size:9pt">{{ r.id }} · v{{ r.version }} · {{ client }}</div>
+  <h1>{{ rec.title }}</h1>
+  <div class="badges">
+    <span class="badge" style="background:{{ sev.soft }};color:{{ sev.text }}"><span class="sq" style="background:{{ sev.solid }}"></span>{{ sev.label }}</span>
+    <span class="badge"><span class="sq" style="background:{{ tlp_square }};{% if tlp == 'CLEAR' %}border:1px solid #8A93A3;{% endif %}"></span>TLP:{{ tlp }}</span>
+    <span class="badge">{{ (rec.confidence or 'moderate')|capitalize }} confidence</span>
+    {% for c in rec.classification or [] %}<span class="badge">{{ c.replace('_',' ')|capitalize }}</span>{% endfor %}
+  </div>
+  <div class="rail">{% for t in rail %}<div style="background:{{ rail_fill(t.count) }}" title="{{ t.name }}"></div>{% endfor %}</div>
+  <div class="rail-labels">{% for t in rail %}<span>{{ t.short }}</span>{% endfor %}</div>
+  <h2 style="margin-top:6pt">Executive summary</h2>
+  {% for para in (rec.executive_summary or '').split('\n\n') %}<p>{{ para }}</p>{% endfor %}
+  <div class="kv" style="margin-top:14pt">
+    <div>Prepared by</div><div>{{ author.name if author else '—' }}</div>
+    <div>Reviewed by</div><div>{{ reviewer.name if reviewer else 'Not yet reviewed' }}</div>
+    <div>Status</div><div>{{ r.status.replace('_',' ')|capitalize }}</div>
+    <div>Published</div><div>{{ fmt(r.published_at) }}</div>
+    <div>Generated</div><div>{{ now }}</div>
+  </div>
+  {% if rec.demo_note %}<div class="demo">{{ rec.demo_note }}</div>{% endif %}
+</section>
+
+<h2>Impact</h2>
+<p><b>{{ sev.label }}.</b> {{ rec.impact.business_impact if rec.impact else '' }}</p>
+{% if rec.impact and rec.impact.blast_radius %}<p><span class="muted">Blast radius:</span> {{ rec.impact.blast_radius }}</p>{% endif %}
+{% if rec.impact %}<p class="muted">Affects:
+  {% if rec.impact.cia.confidentiality %}confidentiality{% endif %}{% if rec.impact.cia.integrity %} · integrity{% endif %}{% if rec.impact.cia.availability %} · availability{% endif %}</p>{% endif %}
+{% for c in rec.conflicts or [] %}
+<div class="callout"><b>Sources disagree: {{ c.topic }}</b>
+  <ul>{% for st in c.statements %}<li>{{ sources[st.source_id].publisher if st.source_id in sources else st.source_id }} ({{ st.date }}): {{ st.text }}</li>{% endfor %}</ul>
+  <div>Status: {{ c.status|capitalize }} — {{ c.resolution }}</div></div>
+{% endfor %}
+
+<h2>Recommendations</h2>
+{% if rec.patching_insufficient %}<p class="flag">Patching alone is insufficient for this threat.</p>{% endif %}
+{% for label, items in grouped_recs %}{% if items %}
+<h3>{{ label }}</h3>
+<ul>{% for x in items %}<li>{{ x.action }} <span class="muted">— {{ x.owner_role }}{% if x.source_ids %} [{{ x.source_ids|join(', ') }}]{% endif %}</span></li>{% endfor %}</ul>
+{% endif %}{% endfor %}
+
+<h2>Result{% if ws %} for {{ ws.name }}{% endif %}</h2>
+{% if result %}
+<div class="result"><b>{{ RESULT[result.status].label }}</b>{% if result.hunt_window %} · hunted {{ result.hunt_window }}{% endif %}<br>{{ result.summary or '' }}</div>
+{% else %}
+<table><thead><tr><th>Workspace</th><th>Result</th><th>Summary</th></tr></thead><tbody>
+{% for x in rec.results or [] %}<tr><td>{{ x.workspace_id }}</td><td>{{ RESULT[x.status].label }}</td><td>{{ x.summary }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+{% if rec.vulnerabilities %}
+<h2>Vulnerabilities</h2>
+<table><thead><tr><th>CVE</th><th>CVSS</th><th>KEV added</th><th>Affected products</th><th>Patch</th></tr></thead><tbody>
+{% for v in rec.vulnerabilities %}<tr><td class="mono">{{ v.cve }}</td><td class="num">{{ v.cvss or '—' }}</td><td>{{ v.kev_added or '—' }}</td><td>{{ v.affected_products|join(', ') }}</td><td class="mono">{{ v.patch_kb|join(', ') or '—' }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+{% if rec.threat_actors %}
+<h2>Threat actors</h2>
+<table><thead><tr><th>Name</th><th>Aliases</th><th>Origin</th><th>Motivation</th><th>Confidence</th></tr></thead><tbody>
+{% for a in rec.threat_actors %}<tr><td>{{ a.name }}</td><td>{{ a.aliases|join(', ') }}</td><td>{{ a.origin }}</td><td>{{ a.motivation|join(', ') }}</td><td>{{ a.attribution_confidence|capitalize }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+{% if rec.attack_paths %}
+<h2>Attack paths</h2>
+{% for p in rec.attack_paths %}<h3>{{ p.id }} · {{ p.name }}</h3>
+<ol>{% for s in p.steps %}<li>{{ s.behaviour }} <span class="mono muted">{{ s.technique_id }}</span></li>{% endfor %}</ol>{% endfor %}
+{% endif %}
+
+<h2>MITRE ATT&amp;CK</h2>
+<table><thead><tr><th>Tactic</th><th>Technique</th><th>Procedure</th><th>Evidence</th><th>Sources</th></tr></thead><tbody>
+{% for m in rec.mitre or [] %}<tr><td>{{ m.tactic }}</td><td><span class="mono">{{ m.technique_id }}</span> {{ m.sub_technique or m.technique }}</td><td>{{ m.procedure }}</td><td class="quote">{{ m.evidence_quote }}</td><td class="mono">{{ m.source_ids|join(', ') }}</td></tr>{% endfor %}
+</tbody></table>
+
+{% if rec.tools_used %}
+<h2>Tools used</h2>
+<ul>{% for t in rec.tools_used %}<li>{{ t.name }} <span class="muted">— {{ t.detail }}</span></li>{% endfor %}</ul>
+{% endif %}
+
+{% if rec.workflow %}
+<h2>Workflow</h2>
+<table><thead><tr><th>Step</th><th>Actor</th><th>Finished</th><th>Notes</th></tr></thead><tbody>
+{% for w in rec.workflow %}<tr><td>{{ w.step }}</td><td>{{ w.actor|capitalize }}</td><td>{{ fmt(w.finished_at) }}</td><td>{{ w.notes }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+<h2>Hunts</h2>
+<p>{{ q_by_type.ioa }} IoA, {{ q_by_type.ioc }} IoC, {{ q_by_type.vuln }} vulnerability and {{ q_by_type.ttp }} TTP queries across {{ platform_names }}. Full queries are in appendix B.</p>
+{% if gaps %}<p class="flag">Coverage gaps:</p><ul>{% for g in gaps %}<li>{{ g.detail }} ({{ g.opportunity_id }})</li>{% endfor %}</ul>{% endif %}
+
+{% if rec.industries %}
+<h2>Industries</h2>
+<p>{% for i in rec.industries %}{{ i.industry }} ({{ i.evidence }}){% if not loop.last %} · {% endif %}{% endfor %}</p>
+{% endif %}
+
+{% if rec.timeline %}
+<h2>Timeline</h2>
+<table><thead><tr><th>Date</th><th>Event</th><th>Source</th></tr></thead><tbody>
+{% for t in rec.timeline %}<tr><td>{{ t.date }}</td><td>{{ t.event }}</td><td class="mono">{{ t.source_ids|join(', ') }}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}
+
+{% if sections.study and rec.study %}
+<h2>Study notes</h2>
+<h3>Background</h3><p>{{ rec.study.background }}</p>
+<h3>How it works</h3><p>{{ rec.study.how_it_works }}</p>
+<h3>Kill chain</h3><p>{{ rec.study.kill_chain_narrative }}</p>
+{% if rec.study.remember %}<h3>What you should remember</h3><ul>{% for x in rec.study.remember %}<li>{{ x }}</li>{% endfor %}</ul>{% endif %}
+{% endif %}
+
+{% if sections.iocs and rec.iocs %}
+<section class="appendix">
+<h2>Appendix A — Indicators of compromise</h2>
+<p class="muted">All values defanged. Verify before blocking.</p>
+<table><thead><tr><th>Type</th><th>Value</th><th>Verdict</th><th>Context</th><th>Sources</th></tr></thead><tbody>
+{% for i in rec.iocs %}<tr><td>{{ i.type }}</td><td class="mono" style="font-size:8.5pt;word-break:break-all">{{ i.value }}</td><td>{{ i.verdict|capitalize }}</td><td>{{ i.context or i.role }}</td><td class="mono">{{ i.source_ids|join(', ') }}</td></tr>{% endfor %}
+</tbody></table>
+</section>
+{% endif %}
+
+{% if sections.queries and queries %}
+<section class="appendix">
+<h2>Appendix B — Hunt queries</h2>
+{% for q in queries %}
+<h4><span class="mono">{{ q.id }}</span> · {{ platform_name(q.platform) }} · {{ qtype[q.type] }} — {{ q.title }}</h4>
+<pre>{{ q.body }}</pre>
+{% if q.log_sources %}<p class="muted" style="font-size:8.5pt">Requires: {{ q.log_sources|join(', ') }}{% if q.fp_notes %} · False positives: {{ q.fp_notes }}{% endif %}</p>{% endif %}
+{% endfor %}
+</section>
+{% endif %}
+
+{% if sections.sources and rec.sources %}
+<section class="appendix">
+<h2>Appendix C — Sources</h2>
+<table><thead><tr><th>ID</th><th>Publisher</th><th>Rating</th><th>Published / updated</th><th>URL</th></tr></thead><tbody>
+{% for s in rec.sources %}<tr><td class="mono">{{ s.id }}</td><td>{{ s.publisher }}<br><span class="muted">{{ s.title }}</span></td><td class="mono">{{ s.reliability }}{{ s.credibility }}</td><td>{{ s.published or '—' }} / {{ s.last_modified or '—' }}</td><td style="word-break:break-all;font-size:8pt"><a href="{{ s.url }}">{{ s.url }}</a></td></tr>{% endfor %}
+</tbody></table>
+</section>
+{% endif %}
+</body>
+</html>

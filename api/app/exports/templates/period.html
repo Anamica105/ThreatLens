@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Period summary</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Mono&family=Atkinson+Hyperlegible+Next:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: "Atkinson Hyperlegible Next", "Segoe UI", sans-serif; color: #181C23; font-size: 10.5pt; line-height: 15pt; margin: 0; }
+  h1 { font-size: 22pt; margin: 0 0 4pt; } h2 { font-size: 14pt; margin: 18pt 0 6pt; }
+  .muted { color: #6A7384; }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8pt; margin: 12pt 0; }
+  .kpi { border: 1px solid #E3E6EB; border-radius: 6pt; padding: 8pt 10pt; }
+  .kpi .v { font-size: 20pt; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 4pt; }
+  table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+  th { text-align: left; background: #F7F8FA; color: #525B6B; border-bottom: 1px solid #CDD2DA; padding: 4pt 6pt; }
+  td { border-bottom: 1px solid #E3E6EB; padding: 4pt 6pt; } td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { height: 6pt; background: #5249A8; border-radius: 3pt; }
+  .mono { font-family: "Atkinson Hyperlegible Mono", Consolas, monospace; }
+</style></head><body>
+<h1>Threat research summary</h1>
+<div class="muted">{{ scope }} · {{ label }} · generated {{ now }}</div>
+<div class="kpis">{% for k in kpis %}<div class="kpi"><div class="muted">{{ k.label }}</div><div class="v">{{ k.value }}</div></div>{% endfor %}</div>
+<h2>Severity mix</h2>
+<table><thead><tr><th>Severity</th><th class="n">Research</th><th style="width:50%"></th></tr></thead><tbody>
+{% for s in severity %}<tr><td>{{ s.label }}</td><td class="n">{{ s.count }}</td><td><div class="bar" style="width:{{ s.pct }}%;background:{{ s.color }}"></div></td></tr>{% endfor %}
+</tbody></table>
+<h2>Results by status</h2>
+<table><thead><tr><th>Result</th><th class="n">Count</th></tr></thead><tbody>
+{% for s in results %}<tr><td>{{ s.label }}</td><td class="n">{{ s.count }}</td></tr>{% endfor %}
+</tbody></table>
+<h2>Top actors</h2>
+<table><thead><tr><th>Actor</th><th class="n">Research</th></tr></thead><tbody>
+{% for a in actors %}<tr><td>{{ a.name }}</td><td class="n">{{ a.count }}</td></tr>{% else %}<tr><td colspan="2" class="muted">None in this period</td></tr>{% endfor %}
+</tbody></table>
+<h2>Research in this period</h2>
+<table><thead><tr><th>ID</th><th>Title</th><th>Severity</th><th>Status</th><th>Created</th></tr></thead><tbody>
+{% for r in rows %}<tr><td class="mono">{{ r.id }}</td><td>{{ r.title }}</td><td>{{ r.severity }}</td><td>{{ r.status }}</td><td>{{ r.created }}</td></tr>{% endfor %}
+</tbody></table>
+</body></html>

@@ -1,0 +1,22 @@
+# Python
+api/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+api/.env
+api/threatlens.db*
+api/data/
+
+# Node
+web/node_modules/
+web/.next/
+web/.next-build/
+web/out/
+web/next-env.d.ts
+*.tsbuildinfo
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,59 @@
+"use client";
+
+import { useState } from "react";
+import { useApp } from "@/components/providers";
+import { Pill } from "@/components/ui/badges";
+import { Button } from "@/components/ui/button";
+import { Alert, SkeletonRows, useToast } from "@/components/ui/feedback";
+import { Input } from "@/components/ui/forms";
+import { Page, PageHeader } from "@/components/ui/layout";
+import { put } from "@/lib/api";
+import { useApi } from "@/lib/hooks";
+
+interface K { id: string; name: string; types: string[]; configured: boolean; source: string | null; hint: string }
+
+export default function OsintKeys() {
+  const { user } = useApp();
+  const toast = useToast();
+  const { data, setData } = useApi<K[]>("/api/settings/osint-keys");
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const canEdit = user?.role === "lead" || user?.role === "admin";
+  const save = async (extra?: Record<string, null>) => {
+    setSaving(true);
+    try {
+      setData(await put<K[]>("/api/settings/osint-keys", { keys: { ...draft, ...extra } }));
+      setDraft({});
+      toast({ tone: "success", message: "OSINT keys saved" });
+    } catch (e) { toast({ tone: "danger", message: (e as Error).message }); } finally { setSaving(false); }
+  };
+  return (
+    <Page>
+      <PageHeader crumbs={[{ label: "Settings", href: "/settings" }, { label: "OSINT API keys" }]} title="OSINT API keys"
+        description="Only public indicators are sent to these services; client names never are. Results are cached for 24 hours." />
+      <div className="max-w-form space-y-4">
+        {!canEdit && <Alert tone="info" title="Read only">Only leads and admins can change keys. Switch user from the account menu to try it.</Alert>}
+        <Alert tone="warning" title="Storage">Keys entered here are stored in the application database. In production, keep them in a secrets vault and supply them as environment variables to the API.</Alert>
+        {!data ? <SkeletonRows rows={7} /> : (
+          <div className="divide-y divide-[var(--border-subtle)] rounded-md border border-line bg-surface">
+            {data.map((k) => (
+              <div key={k.id} className="flex flex-wrap items-center gap-3 p-4">
+                <div className="min-w-[200px] flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-h4 font-semibold">{k.name}</span>
+                    {k.configured ? <Pill tone="success">Configured</Pill> : <Pill tone="neutral">Not set</Pill>}
+                  </div>
+                  <div className="text-caption text-fg-muted">{k.types.join(", ")}{k.source ? ` · from ${k.source}` : ""}{k.hint ? ` · ${k.hint}` : ""}</div>
+                </div>
+                <Input type="password" autoComplete="off" className="w-full sm:w-72" placeholder={k.configured ? "Enter a new key to replace" : "API key"} aria-label={`${k.name} API key`}
+                  disabled={!canEdit} value={draft[k.id] ?? ""} onChange={(e) => setDraft({ ...draft, [k.id]: e.target.value })} />
+                {k.source === "settings" && canEdit && <Button size="sm" variant="danger-secondary" onClick={() => save({ [k.id]: null })}>Remove</Button>}
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-end"><Button variant="primary" loading={saving} disabled={!canEdit || !Object.values(draft).some(Boolean)} disabledReason="Enter at least one key" onClick={() => save()}>Save keys</Button></div>
+      </div>
+    </Page>
+  );
+}

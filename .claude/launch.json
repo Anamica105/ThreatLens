@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": "D:\\ThreatLense\\api\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8000", "--app-dir", "D:\\ThreatLense\\api"],
+      "cwd": "D:\\ThreatLense\\api",
+      "port": 8000
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "C:\\Program Files\\nodejs\\npm.cmd",
+      "runtimeArgs": ["run", "dev", "--prefix", "D:\\ThreatLense\\web"],
+      "cwd": "D:\\ThreatLense\\web",
+      "port": 3000
+    }
+  ]
+}

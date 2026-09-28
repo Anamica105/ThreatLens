@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="color-scheme" content="light only">
+<title>{{ rec.title }}</title></head>
+<body style="margin:0;padding:0;background:#F7F8FA;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#F7F8FA"><tr><td align="center" style="padding:16px 8px;">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#FFFFFF" style="width:600px;max-width:600px;border:1px solid #E3E6EB;font-family:Arial,'Segoe UI',Helvetica,sans-serif;color:#181C23;">
+  <tr><td bgcolor="#F7F8FA" style="border-bottom:1px solid #E3E6EB;padding:0 16px;height:32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#F7F8FA"><tr>
+      <td align="left" style="font-size:12px;font-weight:bold;color:#2A303B;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td bgcolor="#F0F2F5" style="padding:3px 8px;font-size:12px;font-weight:bold;color:#2A303B;">
+            <span style="display:inline-block;width:8px;height:8px;background:{{ tlp_square }};{% if tlp == 'CLEAR' %}border:1px solid #8A93A3;{% endif %}">&nbsp;</span>&nbsp;TLP:{{ tlp }}</td></tr></table>
+      </td>
+      <td align="right" style="font-size:12px;color:#525B6B;">{{ client }} · <span style="font-family:Consolas,'Courier New',monospace;">{{ r.id }}</span></td>
+    </tr></table>
+  </td></tr>
+  {% if logo_data_uri %}<tr><td style="padding:16px 24px 0 24px;"><img src="{{ logo_data_uri }}" width="120" alt="{{ client }}" style="display:block;border:0;"></td></tr>{% endif %}
+  <tr><td style="padding:20px 24px 4px 24px;border-left:4px solid {{ sev.solid }};">
+    <div style="font-size:22px;line-height:28px;font-weight:bold;color:#181C23;">{{ rec.title }}</div>
+  </td></tr>
+  <tr><td style="padding:8px 24px 0 24px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+      <td bgcolor="{{ sev.soft }}" style="padding:3px 8px;font-size:12px;font-weight:bold;color:{{ sev.text }};">{{ sev.label }}</td>
+      <td width="6">&nbsp;</td>
+      <td bgcolor="#F0F2F5" style="padding:3px 8px;font-size:12px;font-weight:bold;color:#2A303B;">{{ (rec.confidence or 'moderate')|capitalize }} confidence</td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:14px 24px 0 24px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="2" border="0"><tr>
+      {% for t in rail %}<td bgcolor="{{ rail_fill(t.count) }}" height="8" style="height:8px;font-size:1px;line-height:1px;">&nbsp;</td>{% endfor %}
+    </tr><tr>
+      {% for t in rail %}<td align="center" style="font-size:9px;line-height:11px;color:#6A7384;">{{ t.short }}</td>{% endfor %}
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:16px 24px 0 24px;font-size:14px;line-height:21px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Executive summary</div>
+    {% for para in (rec.executive_summary or '').split('\n\n') %}<p style="margin:0 0 10px 0;">{{ para }}</p>{% endfor %}
+  </td></tr>
+  {% if rec.impact %}<tr><td style="padding:6px 24px 0 24px;font-size:14px;line-height:21px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Impact</div>
+    <p style="margin:0 0 10px 0;">{{ rec.impact.business_impact }}</p>
+  </td></tr>{% endif %}
+  <tr><td style="padding:6px 24px 0 24px;font-size:14px;line-height:21px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Result for {{ client }}</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td bgcolor="{{ result_style.soft }}" style="padding:10px 12px;font-size:14px;line-height:20px;color:#181C23;">
+      <b style="color:{{ result_style.text }};">{{ result_style.label }}</b>{% if result and result.hunt_window %} · hunted {{ result.hunt_window }}{% endif %}<br>{{ (result.summary if result else '') or 'Hunt not yet recorded for this workspace.' }}
+    </td></tr></table>
+  </td></tr>
+  <tr><td style="padding:16px 24px 0 24px;font-size:14px;line-height:21px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Recommendations</div>
+    {% if rec.patching_insufficient %}<p style="margin:0 0 8px 0;color:#8F5A00;font-weight:bold;">Patching alone is insufficient for this threat.</p>{% endif %}
+    {% for label, items in grouped_recs %}{% if items %}
+      <div style="font-size:13px;font-weight:bold;color:#525B6B;margin:6px 0 4px 0;">{{ label }}</div>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      {% for x in items %}<tr><td width="14" valign="top" style="font-size:14px;line-height:21px;color:#6A7384;">•</td><td style="font-size:14px;line-height:21px;padding-bottom:4px;">{{ x.action }}</td></tr>{% endfor %}
+      </table>
+    {% endif %}{% endfor %}
+  </td></tr>
+  {% if top_ttps %}<tr><td style="padding:16px 24px 0 24px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Top techniques</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="font-size:13px;line-height:18px;">
+      {% for m in top_ttps %}<tr><td width="90" style="padding:4px 0;border-bottom:1px solid #E3E6EB;font-family:Consolas,'Courier New',monospace;color:#433B8E;">{{ m.technique_id }}</td><td style="padding:4px 0;border-bottom:1px solid #E3E6EB;">{{ m.sub_technique or m.technique }}<span style="color:#6A7384;"> · {{ m.tactic }}</span></td></tr>{% endfor %}
+    </table>
+  </td></tr>{% endif %}
+  {% if key_iocs %}<tr><td style="padding:16px 24px 0 24px;">
+    <div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">Key indicators (defanged)</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="font-size:12px;line-height:17px;">
+      {% for i in key_iocs %}<tr><td style="padding:3px 0;border-bottom:1px solid #E3E6EB;font-family:Consolas,'Courier New',monospace;word-break:break-all;">{{ i.value }}</td><td width="90" align="right" style="padding:3px 0;border-bottom:1px solid #E3E6EB;color:#525B6B;">{{ i.verdict|capitalize }}</td></tr>{% endfor %}
+    </table>
+  </td></tr>{% endif %}
+  <tr><td style="padding:20px 24px 24px 24px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td bgcolor="#5249A8" style="padding:10px 16px;">
+      <a href="{{ report_url }}" style="color:#FFFFFF;font-size:14px;font-weight:bold;text-decoration:none;">Read the full report</a></td></tr></table>
+    <p style="margin:14px 0 0 0;font-size:12px;line-height:17px;color:#6A7384;">{{ branding.disclaimer or 'Handle according to the TLP marking.' }} Generated {{ now }}.</p>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>
