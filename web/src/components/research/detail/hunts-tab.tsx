@@ -1,8 +1,8 @@
 "use client";
 
 import { Code, Download, RefreshCw } from "lucide-react";
-import { useMemo, useState } from "react";
-import { download, patch, post } from "@/lib/api";
+import { useEffect, useMemo, useState } from "react";
+import { download, get, patch, post } from "@/lib/api";
 import { PROVENANCE, QUERY_TYPE } from "@/lib/constants";
 import type { Query } from "@/lib/types";
 import { useApp } from "../../providers";
@@ -10,6 +10,7 @@ import { Badge, CountBadge } from "../../ui/badges";
 import { Button } from "../../ui/button";
 import { Alert, EmptyState, useToast } from "../../ui/feedback";
 import { Segmented } from "../../ui/forms";
+import { statusLabel, type MappedFields, type ResearchQueriesResponse } from "../hunts/query-lifecycle";
 import { groupAnchor, groupQueries, sourceIndex } from "../provenance";
 import { QueryBlock } from "../query-block";
 import type { DetailProps } from "./common";
@@ -34,6 +35,18 @@ export function HuntsTab({ d, reload, canEdit, ws }: DetailProps) {
   const [busy, setBusy] = useState(false);
   const sources = useMemo(() => sourceIndex(rec), [rec]);
   const detections = useMemo(() => groupQueries(rec), [rec]);
+  // Server-side field mapping for the active workspace (mapped_body / mapped_lint / mapping_applied per query).
+  const [mapped, setMapped] = useState<{ key: string; byId: Record<string, MappedFields> } | null>(null);
+  const mapKey = workspace ? `${d.id}|${workspace.id}|${d.version}|${d.updated_at}` : null;
+  useEffect(() => {
+    if (!mapKey || !workspace) return;
+    let live = true;
+    get<ResearchQueriesResponse>(`/api/research/${d.id}/queries?ws=${encodeURIComponent(workspace.id)}&include_reference=true`)
+      .then((r) => { if (live) setMapped({ key: mapKey, byId: Object.fromEntries(r.items.map((q) => [q.id, { mapped_body: q.mapped_body, mapped_lint: q.mapped_lint, mapping_applied: q.mapping_applied }])) }); })
+      .catch(() => { if (live) setMapped({ key: mapKey, byId: {} }); });
+    return () => { live = false; };
+  }, [mapKey, workspace, d.id]);
+  const mappedById = mapped && mapped.key === mapKey ? mapped.byId : undefined;
   const provenances = useMemo(() => Array.from(new Set(detections.map((g) => g.provenance))), [detections]);
 
   const gapsFor = (oppId: string | null) =>
@@ -49,12 +62,16 @@ export function HuntsTab({ d, reload, canEdit, ws }: DetailProps) {
   const shown = grouped.filter((g) => type === "all" || type === g.type);
   const shownDet = shown.reduce((a, g) => a + g.count, 0), shownVar = shown.reduce((a, g) => a + g.variants, 0);
 
+  /** Rejects on error (after toasting the API detail) so the query block can roll back its optimistic status. */
   const onPatch = async (qid: string, body: { status?: string; body?: string }) => {
     try {
       await patch(`/api/research/${d.id}/queries/${qid}`, body);
-      toast({ tone: "success", message: body.body ? "Query saved" : body.status === "generated" ? "Issue reported; query moved back to Generated" : `Query marked ${body.status}` });
-      await reload();
-    } catch (e) { toast({ tone: "danger", message: (e as Error).message }); }
+    } catch (e) {
+      toast({ tone: "danger", message: (e as Error).message });
+      throw e;
+    }
+    toast({ tone: "success", message: body.body ? "Query saved" : body.status === "generated" ? "Issue reported; query moved back to Generated" : `Query marked ${statusLabel(body.status ?? "")}` });
+    await reload();
   };
 
   const generate = async (platforms: string[]) => {
@@ -80,7 +97,7 @@ export function HuntsTab({ d, reload, canEdit, ws }: DetailProps) {
       <div className="space-y-3">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-2">
           <p className="text-h3 font-semibold">{plural(detections.length, "detection", "detections")} <span className="font-normal text-fg-muted">· {plural(all.length, "platform variant", "platform variants")}</span></p>
-          <span className="text-caption text-fg-muted">Look-back {rec.hunts.lookback_days} days · {workspace ? `field mappings for ${workspace.name} applied on copy` : "select a workspace to apply its field mappings"}</span>
+          <span className="text-caption text-fg-muted">Look-back {rec.hunts.lookback_days} days · {workspace ? `showing queries mapped for ${workspace.name}` : "select a workspace to apply its field mappings"}</span>
           <Button size="sm" className="ml-auto" icon={<Download />} onClick={() => download(`/api/research/${d.id}/export/queries_csv${ws !== "all" ? `?ws=${ws}` : ""}`)}>Queries CSV</Button>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -110,7 +127,7 @@ export function HuntsTab({ d, reload, canEdit, ws }: DetailProps) {
           </div>
           <div className="space-y-4">
             {g.blocks.map((b) => (
-              <QueryBlock key={b.key} id={groupAnchor(b.key)} title={b.title} refId={b.opportunityId ?? b.queries[0].group ?? null} queries={b.queries} workspace={workspace}
+              <QueryBlock key={b.key} id={groupAnchor(b.key)} title={b.title} refId={b.opportunityId ?? b.queries[0].group ?? null} queries={b.queries} workspace={workspace} mapped={mappedById}
                 gaps={gapsFor(b.opportunityId)} onPatch={canEdit ? onPatch : undefined} canEdit={canEdit}
                 provenance={b.provenance} sourceIds={b.sourceIds} sources={sources} />
             ))}

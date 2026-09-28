@@ -6,19 +6,36 @@ import { useState } from "react";
 import { CardFooter, CardGrid, CardLink, LibraryEmpty, LibraryLayout, TableShell, facetOptions, single } from "@/components/library";
 import { useWsHref } from "@/components/providers";
 import { IocValue } from "@/components/research/ioc-value";
-import { VerdictBadge } from "@/components/ui/badges";
+import { AnyVerdictBadge, VERDICT_LABEL as ANY_VERDICT_LABEL, type AnyVerdict, type IocOverride } from "@/components/research/detail/iocs-tab";
+import { Badge } from "@/components/ui/badges";
 import { Button } from "@/components/ui/button";
 import { ErrorState, SkeletonRows } from "@/components/ui/feedback";
 import { Page, PageHeader, Pagination } from "@/components/ui/layout";
 import { qs } from "@/lib/api";
-import { IOC_TYPE_LABEL, VERDICT } from "@/lib/constants";
+import { IOC_TYPE_LABEL } from "@/lib/constants";
 import { relative, utc } from "@/lib/format";
 import { useApi, useDebounced, useLocalStorage } from "@/lib/hooks";
-import type { Verdict } from "@/lib/types";
 
-interface I { id: number; type: string; value: string; verdict: Verdict; reputation_summary: string; first_seen: string | null; last_seen: string | null; research_count: number; source_count: number; enriched_at: string | null }
+interface I {
+  id: number; type: string; value: string; verdict: AnyVerdict; reputation_summary: string; first_seen: string | null; last_seen: string | null; research_count: number;
+  source_count: number; enriched_at: string | null; expires_at: string | null; expired?: boolean; verdict_override: IocOverride | null;
+}
 
-const VERDICT_LABEL = Object.fromEntries(Object.entries(VERDICT).map(([k, v]) => [k, v.label]));
+const VERDICT_LABEL: Record<string, string> = ANY_VERDICT_LABEL;
+
+function Expiry({ i }: { i: I }) {
+  if (!i.expires_at) return <span className="text-fg-muted">Never</span>;
+  return <span className={i.expired ? "text-fg-muted" : undefined} title={utc(i.expires_at)}>{i.expired ? "Expired " : ""}{utc(i.expires_at, false)}</span>;
+}
+
+function VerdictWithOverride({ i }: { i: I }) {
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1">
+      <AnyVerdictBadge verdict={i.verdict} />
+      {i.verdict_override && <Badge title={`Analyst override${i.verdict_override.by ? ` by ${i.verdict_override.by_name ?? i.verdict_override.by}` : ""}${i.verdict_override.at ? `, ${utc(i.verdict_override.at)}` : ""}${i.verdict_override.note ? `: ${i.verdict_override.note}` : ""}`}>Override</Badge>}
+    </span>
+  );
+}
 
 export default function IocLibrary() {
   const wsHref = useWsHref();
@@ -51,7 +68,7 @@ export default function IocLibrary() {
               {data.items.map((i) => (
                 <CardLink key={i.id} href={wsHref(`/library/iocs/${i.id}`)} label={i.value}>
                   <div className="relative z-[1] min-w-0"><IocValue type={i.type} value={i.value} compact /></div>
-                  <div className="flex min-w-0 items-center gap-2"><VerdictBadge verdict={i.verdict} /><span className="min-w-0 truncate text-body-sm text-fg-muted" title={i.reputation_summary}>{i.reputation_summary || "Not enriched"}</span></div>
+                  <div className="flex min-w-0 items-center gap-2"><VerdictWithOverride i={i} /><span className="min-w-0 truncate text-body-sm text-fg-muted" title={i.reputation_summary}>{i.reputation_summary || "Not enriched"}</span></div>
                   <CardFooter>
                     <span className="min-w-0 truncate tabular">×{i.source_count} sources · {i.research_count} research</span>
                     <span className="ml-auto shrink-0" title={utc(i.last_seen)}>{relative(i.last_seen)}</span>
@@ -64,17 +81,18 @@ export default function IocLibrary() {
         ) : (
           <TableShell footer={<Pagination page={page} pageSize={100} total={data.total} onPage={setPage} />}>
             <table className="tl-table tl-compact w-full">
-              <thead><tr><th>Indicator</th><th>Type</th><th>Verdict</th><th>Reputation</th><th className="num">Sources</th><th className="num">Research</th><th>First seen</th><th>Last seen</th></tr></thead>
+              <thead><tr><th>Indicator</th><th>Type</th><th>Verdict</th><th>Reputation</th><th className="num">Sources</th><th className="num">Research</th><th>First seen</th><th>Last seen</th><th>Expires</th></tr></thead>
               <tbody>{data.items.map((i) => (
                 <tr key={i.id} className="cursor-pointer" onClick={(e) => { if (!(e.target as HTMLElement).closest("button")) router.push(wsHref(`/library/iocs/${i.id}`)); }}>
                   <td className="max-w-[420px] min-w-[220px]"><IocValue type={i.type} value={i.value} compact onOpen={() => router.push(wsHref(`/library/iocs/${i.id}`))} /></td>
                   <td className="whitespace-nowrap">{IOC_TYPE_LABEL[i.type] ?? i.type}</td>
-                  <td><VerdictBadge verdict={i.verdict} /></td>
+                  <td><VerdictWithOverride i={i} /></td>
                   <td className="max-w-[240px] truncate text-fg-muted" title={i.reputation_summary}>{i.reputation_summary || "Not enriched"}</td>
                   <td className="num font-mono">×{i.source_count}</td>
                   <td className="num">{i.research_count}</td>
                   <td className="whitespace-nowrap" title={utc(i.first_seen)}>{relative(i.first_seen)}</td>
                   <td className="whitespace-nowrap" title={utc(i.last_seen)}>{relative(i.last_seen)}</td>
+                  <td className="whitespace-nowrap"><Expiry i={i} /></td>
                 </tr>
               ))}</tbody>
             </table>

@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from . import attack
 from . import detection
+from . import osint
+from .osint import _as_dt
 from .detection import LOG_SOURCES
 from .ioc import refang
 from .models import (Actor, ActivityEvent, Counter, Ioc, MalwareTool, Query, Research, ResearchLink, ResearchVersion,
@@ -172,7 +174,8 @@ def ioc_overrides(db: Session) -> dict[str, dict]:
     return dict(row.value or {}) if row else {}
 
 
-def set_ioc_override(db: Session, ioc_id: int, verdict: str | None, user_id: str | None) -> None:
+def set_ioc_override(db: Session, ioc_id: int, verdict: str | None, user_id: str | None, note: str | None = None,
+                     research_id: str | None = None, by_name: str | None = None) -> None:
     row = db.get(Setting, IOC_OVERRIDE_KEY)
     if row is None:
         row = Setting(key=IOC_OVERRIDE_KEY, value={})
@@ -181,9 +184,82 @@ def set_ioc_override(db: Session, ioc_id: int, verdict: str | None, user_id: str
     if verdict is None:
         value.pop(str(ioc_id), None)
     else:
-        value[str(ioc_id)] = {"verdict": verdict, "by": user_id, "at": datetime.now(timezone.utc).isoformat()}
+        value[str(ioc_id)] = {"verdict": verdict, "by": user_id, "at": datetime.now(timezone.utc).isoformat(),
+                              **({"note": note} if note else {}), **({"research_id": research_id} if research_id else {}),
+                              **({"by_name": by_name} if by_name else {})}
     row.value = value
     db.flush()
+
+
+# ------------------------------------------------------------------ per-record IoC review (analyst FP removal)
+# Analyst decisions on a record's indicators live in record["ioc_review"] = {"decisions": {"<type>|<refanged lower value>":
+# {"verdict"?, "excluded"?, "note"?, "by", "at"}}, "include_expired": bool}. They survive pipeline re-runs (stage_report
+# carries them over) and are applied to record["iocs"] by apply_ioc_review(), which sets on every indicator:
+#   verdict           effective verdict: analyst decision > library override > pipeline
+#   pipeline_verdict  what the pipeline decided (kept so a Restore can go back to it)
+#   verdict_source    "pipeline" | "analyst" | "library"
+#   excluded          analyst excluded it from hunt queries (without changing the verdict)
+#   analyst           {verdict?, excluded?, note, by, at} when there is a decision
+#   hidden_from_hunts benign / false_positive / excluded, or expired unless the hunter opted in to expired indicators
+
+IOC_VERDICTS = ("malicious", "suspicious", "benign", "unknown", "expired", "false_positive")
+HUNT_HIDDEN_VERDICTS = {"benign", "false_positive"}
+
+
+def ioc_key(t: str, value: str) -> str:
+    return f"{t}|{refang(value or '').lower()}"
+
+
+def library_overrides_by_key(db: Session) -> dict[str, dict]:
+    """Library verdict overrides keyed like ioc_key() (the Setting is keyed by Ioc row id)."""
+    ov = ioc_overrides(db)
+    if not ov:
+        return {}
+    ids = [int(k) for k in ov if str(k).isdigit()]
+    rows = db.query(Ioc).filter(Ioc.id.in_(ids)).all() if ids else []
+    return {ioc_key(r.type, r.value): ov[str(r.id)] for r in rows}
+
+
+def library_intel_first_seen(row: Ioc) -> datetime | None:
+    """Intel first-seen of a library indicator: the earliest of each research's intel first-seen (source publication
+    dates) and any provider first-seen in its reputation. None when no intel date is known (insert time never counts)."""
+    return osint.intel_first_seen(row.reputation or {}, [c.get("intel_first_seen") for c in (row.context or [])])
+
+
+def hidden_from_hunts(verdict: str | None, excluded: bool = False, include_expired: bool = False) -> bool:
+    return bool(excluded) or verdict in HUNT_HIDDEN_VERDICTS or (verdict == "expired" and not include_expired)
+
+
+def apply_ioc_review(rec: dict, lib_overrides: dict[str, dict] | None = None) -> dict:
+    """Apply the record's analyst decisions and library overrides to record["iocs"] (see the block comment above).
+    Mutates and returns `rec`."""
+    review = rec.get("ioc_review") or {}
+    decisions = review.get("decisions") or {}
+    include_expired = bool(review.get("include_expired"))
+    lib = lib_overrides or {}
+    for i in rec.get("iocs", []) or []:
+        k = ioc_key(i.get("type", ""), i.get("value", ""))
+        if "pipeline_verdict" not in i:
+            i["pipeline_verdict"] = i.get("verdict", "unknown")
+        d = decisions.get(k)
+        lo = lib.get(k)
+        if d and d.get("verdict"):
+            i["verdict"], i["verdict_source"] = d["verdict"], "analyst"
+        elif lo and lo.get("verdict"):
+            i["verdict"], i["verdict_source"] = lo["verdict"], "library"
+        else:
+            i["verdict"], i["verdict_source"] = i["pipeline_verdict"], "pipeline"
+        i["excluded"] = bool(d and d.get("excluded"))
+        if d:
+            i["analyst"] = {x: d[x] for x in ("verdict", "excluded", "note", "by", "by_name", "at") if d.get(x) not in (None, "")}
+        else:
+            i.pop("analyst", None)
+        if lo:
+            i["library_override"] = lo
+        else:
+            i.pop("library_override", None)
+        i["hidden_from_hunts"] = hidden_from_hunts(i["verdict"], i["excluded"], include_expired)
+    return rec
 
 
 def _diff(old: dict, new: dict) -> dict:
@@ -278,6 +354,7 @@ def sync_library(db: Session, r: Research) -> None:
         _upsert_link(db, r.id, "cve", v["cve"])
 
     overrides = ioc_overrides(db)
+    expiry = osint.get_expiry(db)
     for i in rec.get("iocs", []):
         val = refang(i["value"])
         row = db.query(Ioc).filter_by(type=i["type"], value=val).first()
@@ -285,12 +362,21 @@ def sync_library(db: Session, r: Research) -> None:
             row = Ioc(type=i["type"], value=val, first_seen=r.created_at)
             db.add(row)
         ov = overrides.get(str(row.id)) if row.id is not None else None
-        row.verdict = ov["verdict"] if ov else i.get("verdict", row.verdict)
+        # A per-record analyst decision stays on the record; the library keeps the pipeline verdict unless the analyst
+        # propagated it (which writes a library override).
+        row.verdict = ov["verdict"] if ov else i.get("pipeline_verdict") or i.get("verdict", row.verdict)
         if i.get("reputation"):
             row.reputation = i["reputation"]
         ctx = [c for c in (row.context or []) if c.get("research_id") != r.id]
-        ctx.append({"research_id": r.id, "context": i.get("context", ""), "role": i.get("role", ""), "sources": i.get("source_ids", [])})
+        ctx.append({"research_id": r.id, "context": i.get("context", ""), "role": i.get("role", ""), "sources": i.get("source_ids", []),
+                    **({"intel_first_seen": i["intel_first_seen"]} if i.get("intel_first_seen") else {})})
         row.context = ctx[-20:]
+        # Expiry is counted from intel first-seen (earliest source publication / provider first-seen), not insert time.
+        intel_fs = library_intel_first_seen(row)
+        if intel_fs is not None:
+            cur = _as_dt(row.first_seen)
+            row.first_seen = min(cur, intel_fs) if cur else intel_fs
+        row.expires_at = osint.expires_at(row.type, intel_fs, expiry)
         row.last_seen = now
         db.flush()
         _upsert_link(db, r.id, "ioc", f"{row.id}")

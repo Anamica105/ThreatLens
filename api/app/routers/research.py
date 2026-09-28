@@ -6,19 +6,19 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query as Q
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from .. import detection, llm
+from .. import attack, detection, guardrails, llm
 from ..db import get_db
 from ..deps import REVIEW_ROLES, current_user, iso, research_summary, user_dict, workspace_dict
 from ..exports import context as export_ctx
 from ..exports import render
 from ..models import ActivityEvent, ExportLog, Query, Research, ResearchVersion, Result, Run, RunLog, User, Workspace
 from ..pipeline import runner
-from ..records import backfill_provenance, log_activity, new_research_id, save_record, tactic_rail
+from ..records import backfill_provenance, log_activity, new_research_id, save_record, sort_sids, tactic_rail
 
 router = APIRouter(prefix="/api/research", tags=["research"])
 
@@ -242,7 +242,9 @@ def patch_record(rid: str, body: RecordPatch, db: Session = Depends(get_db), use
     if bad:
         raise HTTPException(422, f"Not editable: {', '.join(sorted(bad))}")
     rec = copy.deepcopy(r.record or {})
+    old = r.record or {}
     rec.update(body.changes)
+    _stamp_edited_items(old, rec, body.changes)
     if "severity" in body.changes and isinstance(rec.get("impact"), dict):
         rec["impact"]["severity"] = body.changes["severity"]
     rec["_edited"] = sorted(set(rec.get("_edited", [])) | set(body.changes))
@@ -309,21 +311,17 @@ def change_status(rid: str, body: StatusChange, db: Session = Depends(get_db), u
         if r.status != "in_review":
             hint = " Submit it for review first." if r.status in ("draft", "failed") else ""
             raise HTTPException(409, f"Only research in review can be published (status is {r.status}).{hint}")
-        blockers = []
-        disputed = [c for c in rec.get("conflicts", []) if c.get("status") == "disputed"]
-        if disputed:
-            blockers.append(f"{len(disputed)} disputed claim(s) need a status")
-        unsupported = [c for c in rec.get("claims", []) if not c.get("source_ids")]
-        if unsupported:
-            blockers.append(f"{len(unsupported)} unsupported claim(s) must be edited or removed")
-        if blockers:
-            raise HTTPException(409, "Cannot publish: " + "; ".join(blockers))
+        # Grounding gate (spec §12): unsupported statements cannot be published unedited.
+        ready = _readiness(db, r)
+        if not ready["ready"]:
+            return JSONResponse(status_code=409, content={"detail": guardrails.blocking_message(ready), **ready})
         r.status = "published"
         r.reviewed_by = user.id
         r.published_at = datetime.now(timezone.utc)
         new = copy.deepcopy(rec)
         new["status"] = "published"
-        new["review"] = {k: "approved" for k in new.get("review", {})}
+        # Review states are left as the reviewers set them: bulk-approving here would silently downgrade every
+        # unsupported item to a warning if the record is edited and re-reviewed later.
         msg = f"Published by {user.name}"
         # Publishing is a versioned edit like any other: it writes a ResearchVersion row (and re-syncs the libraries).
         save_record(db, r, new, user.id, msg + (f": {body.note}" if body.note else ""))
@@ -340,6 +338,281 @@ def change_status(rid: str, body: StatusChange, db: Session = Depends(get_db), u
     log_activity(db, rid, "status", msg + (f": {body.note}" if body.note else ""), user.id)
     db.commit()
     return {"status": r.status}
+
+
+# ------------------------------------------------------------------ grounding gate & reviewer editing (B03 / B04)
+
+LIST_SECTIONS = ("claims", "recommendations", "mitre", "industries", "threat_actors", "malware_tools", "vulnerabilities",
+                 "attack_paths", "timeline", "ioas", "iocs")
+
+
+def _strip_flag(x):
+    return {k: v for k, v in x.items() if k != "_edited"} if isinstance(x, dict) else x
+
+
+def _stamp_edited_items(old: dict, new: dict, changes: dict) -> None:
+    """Mark list items that a wholesale section save added or changed with `_edited: true`, so the grounding gate
+    knows a person wrote them. Unchanged items keep whatever flag they had."""
+    for k in changes:
+        if k not in LIST_SECTIONS or not isinstance(new.get(k), list):
+            continue
+        before = [_strip_flag(x) for x in old.get(k, []) or []]
+        for item in new[k]:
+            if isinstance(item, dict) and _strip_flag(item) not in before:
+                item["_edited"] = True
+
+
+def _run_ids(db: Session, rid: str) -> list[str]:
+    return [x.id for x in db.query(Run).filter_by(research_id=rid).order_by(Run.started_at.desc().nullslast()).all()]
+
+
+def _readiness(db: Session, r: Research) -> dict:
+    return guardrails.readiness(r.record or {}, _run_ids(db, r.id))
+
+
+@router.get("/{rid}/readiness")
+def readiness(rid: str, db: Session = Depends(get_db)):
+    """Grounding gate: {ready, blocking, warnings, issues:[{section, index, step?, ref?, field, kind, text, severity, anchor}]}.
+    Publishing is refused (409, same body plus `detail`) while `blocking` > 0."""
+    return _readiness(db, _get(db, rid))
+
+
+def _check_can_edit(r: Research, user: User) -> None:
+    """Hunters may edit drafts; reviewers, leads and admins may edit at any stage (except archived)."""
+    if r.status == "archived":
+        raise HTTPException(409, "Archived research is read-only. Restore it first.")
+    if user.role not in REVIEW_ROLES and r.status not in ("draft", "failed"):
+        raise HTTPException(403, "Only reviewers, leads and admins can edit research once it is in review or published.")
+
+
+def _unchanged(db: Session, r: Research) -> dict:
+    return {"version": r.version, "status": r.status, "record": r.record, "readiness": _readiness(db, r)}
+
+
+def _save_edit(db: Session, r: Research, rec: dict, user: User, section: str, summary: str) -> dict:
+    rec["_edited"] = sorted(set(rec.get("_edited", [])) | {section})  # a re-run keeps this section as edited
+    review = rec.setdefault("review", {})
+    if section in review:
+        review[section] = "edited"
+    if r.status == "published":
+        r.status = "in_review"
+        rec["status"] = "in_review"
+        log_activity(db, r.id, "status", f"Moved back to review after edits by {user.name}", user.id)
+    save_record(db, r, rec, user.id, summary)
+    log_activity(db, r.id, "edited", f"v{r.version} · {summary} by {user.name}", user.id, sections=[section])
+    db.commit()
+    return _unchanged(db, r)
+
+
+def _check_sources(rec: dict, ids: list[str]) -> list[str]:
+    known = {s.get("id") for s in rec.get("sources", [])}
+    bad = [s for s in ids if s not in known]
+    if bad:
+        raise HTTPException(422, f"Unknown source id(s): {', '.join(bad)}. Cite one of the report's sources.")
+    return sort_sids(ids)
+
+
+def _technique(tid: str) -> dict:
+    t = attack.technique(tid or "")
+    if not t:
+        shown = (tid or "").strip() or "An empty id"
+        raise HTTPException(422, f"{shown} is not an ATT&CK Enterprise technique in the current catalog.")
+    return t
+
+
+class TitleIn(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+
+
+@router.patch("/{rid}/title")
+def edit_title(rid: str, body: TitleIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    title = " ".join(body.title.split())
+    if title == rec.get("title"):
+        return _unchanged(db, r)
+    rec["title"] = title
+    return _save_edit(db, r, rec, user, "title", "Edited title")
+
+
+CONFIDENCE = ("low", "moderate", "high")
+
+
+class MitreIn(BaseModel):
+    technique_id: str
+    tactic_id: str | None = None
+    procedure: str = ""
+    evidence_quote: str = ""
+    source_ids: list[str] = []
+    confidence: str = "moderate"
+
+
+def _mitre_row(body: MitreIn, rec: dict) -> dict:
+    t = _technique(body.technique_id)
+    if body.confidence not in CONFIDENCE:
+        raise HTTPException(422, f"Confidence must be one of: {', '.join(CONFIDENCE)}.")
+    if body.tactic_id and body.tactic_id not in t["tactic_ids"]:
+        names = ", ".join(attack.TACTIC_BY_ID.get(x, {}).get("name", x) for x in t["tactic_ids"])
+        raise HTTPException(422, f"{t['id']} does not belong to tactic {body.tactic_id}. Its tactics: {names}.")
+    tactic_id = body.tactic_id or (t["tactic_ids"] or [""])[0]
+    technique, sub = (t["name"].split(": ", 1) + [""])[:2] if "." in t["id"] else (t["name"], "")
+    return {"tactic_id": tactic_id, "tactic": attack.TACTIC_BY_ID.get(tactic_id, {}).get("name", ""), "technique_id": t["id"],
+            "technique": technique, "sub_technique": sub, "procedure": body.procedure.strip(),
+            "evidence_quote": " ".join(body.evidence_quote.split()), "source_ids": _check_sources(rec, body.source_ids),
+            "confidence": body.confidence, "_edited": True}
+
+
+def _sort_mitre(rows: list[dict]) -> list[dict]:
+    order = {t["id"]: i for i, t in enumerate(attack.TACTICS)}
+    return sorted(rows, key=lambda x: (order.get(x.get("tactic_id"), 99), x.get("technique_id", "")))
+
+
+def _mitre_index(rec: dict, idx: int, technique_id: str | None) -> int:
+    rows = rec.get("mitre", [])
+    if not 0 <= idx < len(rows):
+        raise HTTPException(404, "MITRE row not found")
+    if technique_id and rows[idx].get("technique_id") != technique_id.strip().upper():
+        raise HTTPException(409, "The MITRE table changed since you loaded it. Reload and try again.")
+    return idx
+
+
+def _dup(rows: list[dict], row: dict, skip: int = -1) -> bool:
+    return any(i != skip and m.get("technique_id") == row["technique_id"] and m.get("tactic_id") == row["tactic_id"]
+               for i, m in enumerate(rows))
+
+
+@router.post("/{rid}/mitre")
+def add_mitre(rid: str, body: MitreIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    row = _mitre_row(body, rec)
+    if _dup(rec.get("mitre", []), row):
+        raise HTTPException(409, f"{row['technique_id']} is already mapped under {row['tactic']}. Edit that row instead.")
+    rec["mitre"] = _sort_mitre(rec.get("mitre", []) + [row])
+    return _save_edit(db, r, rec, user, "mitre", f"Added {row['technique_id']} to MITRE ATT&CK")
+
+
+@router.put("/{rid}/mitre/{idx}")
+def edit_mitre(rid: str, idx: int, body: MitreIn, db: Session = Depends(get_db), user: User = Depends(current_user),
+               expect: str | None = None):
+    """Replace one MITRE row (index into record.mitre). `expect=<technique id>` guards against editing a row that moved."""
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    idx = _mitre_index(rec, idx, expect)
+    row = _mitre_row(body, rec)
+    if _dup(rec["mitre"], row, idx):
+        raise HTTPException(409, f"{row['technique_id']} is already mapped under {row['tactic']}.")
+    old = rec["mitre"][idx]
+    rec["mitre"][idx] = row
+    rec["mitre"] = _sort_mitre(rec["mitre"])
+    what = row["technique_id"] if old.get("technique_id") == row["technique_id"] else f"{old.get('technique_id')} → {row['technique_id']}"
+    return _save_edit(db, r, rec, user, "mitre", f"Edited MITRE row {what}")
+
+
+@router.delete("/{rid}/mitre/{idx}")
+def delete_mitre(rid: str, idx: int, db: Session = Depends(get_db), user: User = Depends(current_user), expect: str | None = None):
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    idx = _mitre_index(rec, idx, expect)
+    old = rec["mitre"].pop(idx)
+    return _save_edit(db, r, rec, user, "mitre", f"Removed {old.get('technique_id')} from MITRE ATT&CK")
+
+
+class StepIn(BaseModel):
+    ref: str | None = None  # keep the ref of an existing step (detection opportunities point at it); omit for a new step
+    behaviour: str = Field(min_length=1)
+    technique_id: str = ""
+    source_ids: list[str] = []
+
+
+class PathIn(BaseModel):
+    name: str | None = None
+    steps: list[StepIn] | None = None  # full ordered list: add / edit / remove / reorder in one versioned save
+
+
+def _path_steps(rec: dict, pid: str, old_steps: list[dict], steps: list[StepIn]) -> list[dict]:
+    existing = {(s.get("ref") or f"{pid}.{j}"): s for j, s in enumerate(old_steps, 1)}
+    used = {s.get("ref") for p in rec.get("attack_paths", []) for s in p.get("steps", [])}
+    nums = [int(m.group(1)) for x in used if x and x.startswith(pid + ".") for m in [re.search(r"\.(\d+)$", x)] if m]
+    n = max(nums + [0])
+    out, seen = [], set()
+    for s in steps:
+        tid = s.technique_id.strip().upper()
+        if tid:
+            _technique(tid)
+        ref = s.ref if s.ref in existing and s.ref not in seen else None
+        if ref is None:
+            n += 1
+            while f"{pid}.{n}" in used:
+                n += 1
+            ref = f"{pid}.{n}"
+        seen.add(ref)
+        new = {"ref": ref, "behaviour": " ".join(s.behaviour.split()), "technique_id": tid,
+               "source_ids": _check_sources(rec, s.source_ids)}
+        prev = existing.get(ref)
+        if prev is None or prev.get("_edited") or any(prev.get(k) != new[k] for k in ("behaviour", "technique_id", "source_ids")):
+            new["_edited"] = True
+        out.append(new)
+    return out
+
+
+@router.post("/{rid}/attack-paths")
+def add_attack_path(rid: str, body: PathIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    paths = rec.setdefault("attack_paths", [])
+    ids = {p.get("id") for p in paths}
+    i = len(paths) + 1
+    while f"AP-{i}" in ids:
+        i += 1
+    pid = f"AP-{i}"
+    name = (body.name or "").strip() or "New attack path"
+    paths.append({"id": pid, "name": name, "steps": _path_steps(rec, pid, [], body.steps or []), "_edited": True})
+    return _save_edit(db, r, rec, user, "attack_paths", f"Added attack path {pid}")
+
+
+@router.put("/{rid}/attack-paths/{pid}")
+def edit_attack_path(rid: str, pid: str, body: PathIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Rename a path and/or replace its ordered step list (add / edit / remove / reorder). Existing steps keep their ref
+    when sent back with it; new steps get a fresh ref."""
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    path = next((p for p in rec.get("attack_paths", []) if p.get("id") == pid), None)
+    if path is None:
+        raise HTTPException(404, "Attack path not found")
+    changed = []
+    if body.name is not None and body.name.strip() and body.name.strip() != path.get("name"):
+        path["name"] = body.name.strip()
+        path["_edited"] = True
+        changed.append("renamed")
+    if body.steps is not None:
+        new_steps = _path_steps(rec, pid, path.get("steps", []), body.steps)
+        if [_strip_flag(s) for s in new_steps] != [_strip_flag(s) for s in path.get("steps", [])]:
+            removed = {s.get("ref") for s in path.get("steps", [])} - {s["ref"] for s in new_steps}
+            path["steps"] = new_steps
+            path["_edited"] = True  # includes a pure reorder, which leaves every step unchanged
+            changed.append("steps edited" + (f", removed {', '.join(sorted(removed))}" if removed else ""))
+    if not changed:
+        return _unchanged(db, r)
+    return _save_edit(db, r, rec, user, "attack_paths", f"Attack path {pid} {'; '.join(changed)}")
+
+
+@router.delete("/{rid}/attack-paths/{pid}")
+def delete_attack_path(rid: str, pid: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    r = _get(db, rid)
+    _check_can_edit(r, user)
+    rec = copy.deepcopy(r.record or {})
+    before = len(rec.get("attack_paths", []))
+    rec["attack_paths"] = [p for p in rec.get("attack_paths", []) if p.get("id") != pid]
+    if len(rec["attack_paths"]) == before:
+        raise HTTPException(404, "Attack path not found")
+    return _save_edit(db, r, rec, user, "attack_paths", f"Removed attack path {pid}")
 
 
 class BulkAction(BaseModel):

@@ -26,7 +26,8 @@ def refang(value: str) -> str:
 
 def defang(value: str, ioc_type: str | None = None) -> str:
     v = refang(value)
-    if ioc_type in ("sha256", "sha1", "md5", "file_name", "file_path", "registry", "mutex", "user_agent", "ja3", "cve", "wallet"):
+    if ioc_type in ("sha256", "sha1", "md5", "file_name", "file_path", "registry", "mutex", "named_pipe", "user_agent", "ja3",
+                    "ja4", "cve", "wallet"):
         return v
     v = re.sub(r"^http", "hxxp", v, flags=re.I)
     if ioc_type == "email":
@@ -67,7 +68,30 @@ PATTERNS: dict[str, re.Pattern] = {
     "registry": re.compile(r"\b(?:HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKU|HKCR)\\[^\s\"'<>]+", re.I),
     "file_name": re.compile(r"\b[\w\-]+\.(?:aspx|asp|jsp|php|exe|dll|ps1|bat|vbs|js|hta|lnk|sys|scr|msi|jar)\b", re.I),
     "wallet": re.compile(r"\b(?:bc1[a-z0-9]{25,39}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b"),
+    # IPv6: a loose candidate (also defanged "[:]"), validated with ipaddress and kept only when globally routable.
+    "ipv6": re.compile(r"(?<![\w:.\[])(?:[0-9a-f]{0,4}(?::|\[:\])){2,7}[0-9a-f]{0,4}(?![\w:])", re.I),
+    # JA3/JA3S fingerprints are bare MD5s, so only when labelled ("JA3: <md5>", "JA3S hash <md5>"). Group 1 = value.
+    "ja3": re.compile(r"\bJA3S?\b(?:\s+(?:hash|fingerprint|digest))?\s*(?:[:=]|is)?\s*[\"'`]?([a-f0-9]{32})\b", re.I),
+    # JA4 (FoxIO): t13d1516h2_8daaf6152771_b186095e22b6 (TCP t / QUIC q / DTLS d).
+    "ja4": re.compile(r"\b[tqd](?:1[0-3]|s3|00)[di]\d{4}[a-z0-9]{2}_[a-f0-9]{12}_[a-f0-9]{12}\b", re.I),
+    # User agents only when labelled ("User-Agent: ..." / user agent "...") or a quoted Mozilla/curl/... string.
+    "user_agent": re.compile(
+        r"(?:\buser[- ]?agent\b(?:\s+string)?\s*(?:[:=]|of|was|is)?\s*[\"“`]([^\"”`\r\n]{6,400})[\"”`]"
+        r"|\buser[- ]?agent\s*:[ \t]*([^\"“\r\n]{6,400}?)[ \t]*$"
+        r"|[\"“]((?:Mozilla|curl|Wget|python-requests|Go-http-client|okhttp|Java|WindowsPowerShell|WinHTTP|Microsoft BITS)/[^\"”\r\n]{1,400})[\"”])",
+        re.I | re.M),
+    # Mutexes only when quoted or labelled ("mutex: X", mutex named "X") or with a Global\ / Local\ namespace.
+    "mutex": re.compile(
+        r"(?:\bmutex(?:es)?\b(?:\s+(?:named|name|called|value|string))?\s*(?:[:=]\s*[\"“'`]?|[\"“'`])"
+        r"((?:Global\\|Local\\)?[\w\-{}.$#@]{3,120})"
+        r"|\b((?:Global|Local)\\[\w\-{}.$#@]{3,120}))", re.I),
+    # Named pipes: \\.\pipe\name (also with doubled backslashes as in code) or labelled: named pipe "name".
+    "named_pipe": re.compile(
+        r"(?:\\{2,4}[.?]\\{1,2}pipe\\{1,2}([\w\-{}.$#@]{2,120})"
+        r"|\bnamed[- ]pipe\b(?:\s+(?:named|name|called))?\s*(?:[:=]\s*[\"“'`]?|[\"“'`])([\w\-{}.$#@]{2,120}))", re.I),
 }
+# Types whose pattern captures the value in a group (the label / quotes around it are not part of the indicator).
+_GROUPED = {"ja3", "user_agent", "mutex", "named_pipe"}
 
 # ---------- allow-lists (drop false positives) ----------
 
@@ -88,6 +112,27 @@ BENIGN_FILE_NAMES = {"cmd.exe", "powershell.exe", "pwsh.exe", "w3wp.exe", "rundl
                      "lsass.exe", "wmic.exe", "csc.exe", "conhost.exe", "services.exe", "msiexec.exe", "regsvr32.exe",
                      "mshta.exe", "schtasks.exe", "net.exe", "whoami.exe", "iisreset.exe", "signout.aspx", "toolpane.aspx",
                      "start.aspx", "default.aspx"}
+# Well-known legitimate tool / file hashes (spec 9: "drop false positives with ... well-known tool hashes"). A hash on
+# this list is still extracted (it is evidence of what the attacker used) but gets the verdict "benign", so it is never
+# flagged malicious and is hidden from hunt queries by default.
+# NEEDS CURATION: this ships only with hashes that are unambiguous (the empty file). Add the signed builds of the admin
+# tools your hunters keep seeing in reports (Sysinternals PsExec/ProcDump/AdExplorer, 7-Zip, AnyDesk, rclone, ...)
+# taken from the vendor's own published hashes, here or per deployment in the Setting "ioc_known_good_hashes"
+# ({"<lower-case hash>": "label"}), which is merged in at run time.
+KNOWN_GOOD_HASHES: dict[str, str] = {
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855": "Empty file (SHA-256)",
+    "da39a3ee5e6b4b0d3255bfef95601890afd80709": "Empty file (SHA-1)",
+    "d41d8cd98f00b204e9800998ecf8427e": "Empty file (MD5)",
+}
+KNOWN_GOOD_HASHES_SETTING = "ioc_known_good_hashes"
+
+
+def known_good_hash(value: str, extra: dict[str, str] | None = None) -> str | None:
+    """Label of a well-known legitimate hash, else None. `extra` = deployment additions (Setting ioc_known_good_hashes)."""
+    v = (value or "").strip().lower()
+    return KNOWN_GOOD_HASHES.get(v) or (extra or {}).get(v)
+
+
 # File names that look like domains (".js", ".exe" aren't TLDs, but ".zip"/".mov" are).
 _FILE_EXT_TLDS = {"zip", "mov", "app", "sh", "py", "pl", "rs"}
 
@@ -102,6 +147,8 @@ def _is_public_ip(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
+    if addr.version == 6:
+        return addr.is_global and addr.ipv4_mapped is None
     return not (addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_multicast or addr.is_link_local or addr.is_unspecified)
 
 
@@ -136,14 +183,38 @@ def extract(text: str) -> list[Extracted]:
         else:
             found[key] = Extracted(t, v, [ctx])
 
-    order = ["url", "email", "sha256", "sha1", "md5", "cve", "ipv4", "registry", "file_path", "domain", "file_name", "wallet"]
+    order = ["user_agent", "url", "email", "ja4", "ja3", "sha256", "sha1", "md5", "cve", "named_pipe", "mutex", "ipv6", "ipv4",
+             "registry", "file_path", "domain", "file_name", "wallet"]
     for t in order:
         for m in PATTERNS[t].finditer(text):
             if overlaps(m.start(), m.end()):
                 continue
+            if t in _GROUPED:
+                raw = next((g for g in m.groups() if g), "").strip()
+                v = raw.lower() if t == "ja3" else raw if t == "user_agent" else raw.rstrip(".,;:")
+                if t == "named_pipe" and v:
+                    v = "\\\\.\\pipe\\" + v  # canonical \\.\pipe\<name>, whatever form the article used
+                if t == "user_agent":
+                    v = re.sub(r"\s+", " ", v).strip()
+                    if not re.search(r"[/(]", v):  # "the user agent is unknown" is not a UA string
+                        continue
+                if not v:
+                    continue
+                consumed.append((m.start(), m.end()))
+                add(t, v, m)
+                continue
             raw = m.group(0).rstrip(".,;:")
             v = refang(raw)
-            if t == "url":
+            if t == "ipv6":
+                try:
+                    v = str(ipaddress.IPv6Address(v))
+                except ValueError:
+                    continue
+                if not _is_public_ip(v):
+                    continue
+            elif t == "ja4":
+                v = v.lower()
+            elif t == "url":
                 host = re.sub(r"^[a-z]+://", "", v, flags=re.I).split("/")[0].split(":")[0]
                 if _in_allow_list(host):
                     consumed.append((m.start(), m.end()))
@@ -182,7 +253,9 @@ def extract(text: str) -> list[Extracted]:
 
 def detect_type(value: str) -> str:
     v = refang(value)
-    for t in ("url", "email", "sha256", "sha1", "md5", "cve", "ipv4", "registry", "file_path", "domain", "file_name"):
+    if re.fullmatch(r"\\\\[.?]\\pipe\\\S+", v, re.I):
+        return "named_pipe"
+    for t in ("url", "email", "ja4", "sha256", "sha1", "md5", "cve", "ipv4", "registry", "file_path", "domain", "file_name"):
         if PATTERNS[t].fullmatch(v):
             return t
     try:
@@ -197,4 +270,5 @@ SR_TYPE_NAMES = {
     "ipv4": "IP address", "ipv6": "IP address", "domain": "Domain", "url": "URL", "sha256": "SHA-256 hash",
     "sha1": "SHA-1 hash", "md5": "MD5 hash", "file_name": "File name", "file_path": "File path", "email": "Email",
     "registry": "Registry key", "user_agent": "User agent", "wallet": "Crypto wallet", "mutex": "Mutex", "cve": "CVE",
+    "named_pipe": "Named pipe", "ja3": "JA3 fingerprint", "ja4": "JA4 fingerprint",
 }

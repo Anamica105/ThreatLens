@@ -222,7 +222,13 @@ def test_review_states_and_publish():
         assert c.post(f"/api/research/{rid}/review", json={"section": "executive_summary", "state": "nope"}, headers=REVIEWER).status_code == 422
         assert c.post(f"/api/research/{rid}/review", json={"section": "executive_summary"}, headers=REVIEWER).status_code == 200
         assert c.post(f"/api/research/{rid}/status", json={"action": "submit"}, headers=HUNTER).status_code == 200
-        before = c.get(f"/api/research/{rid}/versions").json()
+        # Grounding gate (test_r1): sample drafts cite no sources, so the reviewer explicitly approves the blocking sections.
+        ready = c.get(f"/api/research/{rid}/readiness").json()
+        if ready["blocking"]:
+            assert c.post(f"/api/research/{rid}/status", json={"action": "publish"}, headers=REVIEWER).status_code == 409
+        for section in {i["section"] for i in ready["issues"] if i["severity"] == "block"}:
+            assert c.post(f"/api/research/{rid}/review", json={"section": section}, headers=REVIEWER).status_code == 200
+        before =c.get(f"/api/research/{rid}/versions").json()
         r = c.post(f"/api/research/{rid}/status", json={"action": "publish", "note": "LGTM"}, headers=REVIEWER)
         assert r.status_code == 200 and r.json()["status"] == "published"
         after = c.get(f"/api/research/{rid}/versions").json()

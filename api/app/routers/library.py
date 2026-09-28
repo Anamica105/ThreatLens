@@ -10,9 +10,9 @@ from sqlalchemy.orm import Session
 from .. import attack, osint
 from ..db import get_db
 from ..deps import current_user, iso
-from ..ioc import defang
+from ..ioc import defang, known_good_hash
 from ..models import Actor, Ioc, MalwareTool, Query, Research, ResearchLink, User, Vulnerability, Workspace
-from ..records import ioc_overrides, set_ioc_override, tactic_rail
+from ..records import IOC_VERDICTS, ioc_overrides, library_intel_first_seen, set_ioc_override, tactic_rail
 
 router = APIRouter(prefix="/api/library", tags=["library"])
 
@@ -456,6 +456,8 @@ def _ioc_dict(i: Ioc, rids: list[str], prov: _Prov, detail: bool = False, overri
             "reputation_summary": osint.reputation_summary(i.reputation or {}), "context": i.context,
             "first_seen": iso(i.first_seen), "last_seen": iso(i.last_seen), "enriched_at": iso(i.enriched_at),
             "expires_at": iso(i.expires_at), "research_count": len(rids), "source_count": len(srcs),
+            "expired": bool(i.expires_at and osint._as_dt(i.expires_at) <= datetime.now(timezone.utc)),
+            "intel_first_seen": iso(library_intel_first_seen(i)),
             "verdict_override": (overrides or {}).get(str(i.id)),
             **(_prov_detail if detail else _prov_summary)(prov.items(rids, _ioc_pick(i)))}
 
@@ -479,7 +481,7 @@ def iocs(db: Session = Depends(get_db), q: str | None = None, type: str | None =
     ov = ioc_overrides(db)
     items = [_ioc_dict(i, links.get(str(i.id), []), prov, overrides=ov) for i in page_rows]
     return {"total": len(all_rows), "items": items,
-            "facets": {"type": sorted({i.type for i in db.query(Ioc).all()}), "verdict": ["malicious", "suspicious", "benign", "unknown", "expired"]}}
+            "facets": {"type": sorted({i.type for i in db.query(Ioc).all()}), "verdict": list(IOC_VERDICTS)}}
 
 
 @router.get("/iocs/{iid}")
@@ -504,29 +506,49 @@ def enrich_ioc(iid: int, db: Session = Depends(get_db), user: User = Depends(cur
     i.enriched_at = datetime.now(timezone.utc)
     reliable = any(c.get("role") for c in (i.context or []))
     ov = ioc_overrides(db).get(str(i.id))
-    i.verdict = ov["verdict"] if ov else osint.verdict(i.type, rep, reliable, "B" if reliable else None, i.first_seen)
+    expiry = osint.get_expiry(db)
+    fs = library_intel_first_seen(i)  # intel first-seen, never the library insert time
+    i.expires_at = osint.expires_at(i.type, fs, expiry)
+    i.verdict = ov["verdict"] if ov else osint.verdict(i.type, rep, reliable, "B" if reliable else None, fs, expiry,
+                                                       known_good=bool(known_good_hash(i.value)))
     db.commit()
     return ioc_detail(iid, db)
 
 
+def _pipeline_verdict(db: Session, i: Ioc) -> str | None:
+    """The verdict the pipeline gave this indicator in the most recently updated research that carries it."""
+    from ..records import ioc_key
+    k = ioc_key(i.type, i.value)
+    rids = [l.research_id for l in db.query(ResearchLink).filter_by(entity_type="ioc", entity_key=str(i.id)).all()]
+    rows = db.query(Research).filter(Research.id.in_(rids)).order_by(Research.updated_at.desc()).all() if rids else []
+    for r in rows:
+        for e in (r.record or {}).get("iocs", []):
+            if ioc_key(e.get("type", ""), e.get("value", "")) == k:
+                return e.get("pipeline_verdict") or e.get("verdict")
+    return None
+
+
 class IocPatch(BaseModel):
     verdict: str | None = None
+    note: str | None = None
     clear_override: bool = False  # drop the analyst override; the verdict is recomputed on the next sync/enrichment
 
 
 @router.patch("/iocs/{iid}")
 def patch_ioc(iid: int, body: IocPatch, db: Session = Depends(get_db), user: User = Depends(current_user)):
     """Setting a verdict here records an analyst override that later research syncs and enrichment do not clobber."""
-    if not body.clear_override and body.verdict not in ("malicious", "suspicious", "benign", "unknown", "expired"):
+    if not body.clear_override and body.verdict not in IOC_VERDICTS:
         raise HTTPException(422, "Invalid verdict")
     i = db.get(Ioc, iid)
     if i is None:
         raise HTTPException(404, "Indicator not found")
     if body.clear_override:
         set_ioc_override(db, iid, None, user.id)
+        # Back to the latest pipeline verdict recorded for it (the most recent research that carries it).
+        i.verdict = _pipeline_verdict(db, i) or i.verdict
     else:
         i.verdict = body.verdict
-        set_ioc_override(db, iid, body.verdict, user.id)
+        set_ioc_override(db, iid, body.verdict, user.id, note=(body.note or "").strip() or None, by_name=user.name)
     db.commit()
     return ioc_detail(iid, db)
 

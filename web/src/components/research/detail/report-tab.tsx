@@ -6,7 +6,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { HORIZON, SEVERITY, SEVERITIES } from "@/lib/constants";
 import { utc } from "@/lib/format";
-import type { MitreRow, ResearchRecord, ResultStatus, Severity } from "@/lib/types";
+import type { ResearchRecord, ResultStatus, Severity } from "@/lib/types";
 import { useApp, useWsHref } from "../../providers";
 import { AttackChip, Avatar, Badge, Chip, ConfidenceBadge, GeneratedBadge, ResultPill, SeverityBadge, TlpBadge } from "../../ui/badges";
 import { Button } from "../../ui/button";
@@ -16,6 +16,9 @@ import { DefinitionList, Panel } from "../../ui/layout";
 import { Dialog } from "../../ui/overlay";
 import { patch, post, put } from "@/lib/api";
 import { ClaimConflict } from "../claim-conflict";
+import { VulnTable } from "../vuln-table";
+import { AttackPathDialog, deleteMitre, EditedMark, MitreDialog } from "../review/editors";
+import { canReviewEdit, isEdited, isReviewer, type AttackPathE, type MitreRowE, type Readiness } from "../review/readiness";
 import { IocValue } from "../ioc-value";
 import { groupAnchor, groupQueries } from "../provenance";
 import { SectionHeading, SourceRefs, type DetailProps, Quote } from "./common";
@@ -27,8 +30,22 @@ const TOC = [
   ["industries", "Industries"], ["timeline", "Timeline"],
 ] as const;
 
-export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }: DetailProps & { tacticFilter: string | null }) {
+export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, readiness }: DetailProps & { tacticFilter: string | null; readiness?: Readiness }) {
   const rec = d.record;
+  const { user } = useApp();
+  const reviewer = isReviewer(user);
+  /** Structured edits (MITRE rows, attack paths): hunters on drafts, reviewers/leads/admins always. */
+  const editable = canReviewEdit(user, d.status);
+  const [mitreEdit, setMitreEdit] = useState<null | { row?: MitreRowE; index?: number }>(null);
+  const [pathEdit, setPathEdit] = useState<null | { path: AttackPathE | null }>(null);
+  const flagged = useMemo(() => {
+    const m = new Map<string, "block" | "warn">();
+    for (const i of readiness?.issues ?? []) {
+      const k = i.section === "attack_paths" ? `attack_paths:${i.index}:${i.step}` : `${i.section}:${i.index}`;
+      if (m.get(k) !== "block") m.set(k, i.severity);
+    }
+    return m;
+  }, [readiness]);
   const sources = useMemo(() => Object.fromEntries(rec.sources.map((s) => [s.id, s])), [rec.sources]);
   const [active, setActive] = useState<string>("executive-summary");
   const [editing, setEditing] = useState<null | "summary" | "impact" | "recs" | "title">(null);
@@ -53,14 +70,27 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
     } catch (e) { toast({ tone: "danger", message: (e as Error).message }); }
   };
   const approve = async (section: string) => {
-    await post(`/api/research/${d.id}/review`, { section, state: "approved" });
-    reload();
+    try {
+      await post(`/api/research/${d.id}/review`, { section, state: "approved" });
+      toast({ tone: "success", message: `Section ${section.replace(/_/g, " ")} approved` });
+      await reload();
+    } catch (e) { toast({ tone: "danger", message: (e as Error).message }); }
+  };
+  const removeMitre = async (m: MitreRowE) => {
+    try {
+      await deleteMitre(d.id, rec.mitre.indexOf(m), m.technique_id);
+      toast({ tone: "success", message: `Removed ${m.technique_id}` });
+      await reload();
+    } catch (e) { toast({ tone: "danger", message: (e as Error).message }); }
   };
   const review = rec.review ?? {};
-  const ReviewBar = ({ section }: { section: string }) => review[section] && review[section] !== "approved" ? (
+  const inReview = ["draft", "in_review", "failed"].includes(d.status);
+  // Section approval is a reviewer decision: hunters see the review state but not the control.
+  const blocks = (section: string) => readiness?.issues.some((i) => i.section === section && i.severity === "block") ?? false;
+  const ReviewBar = ({ section }: { section: string }) => inReview && ((review[section] && review[section] !== "approved") || blocks(section)) ? (
     <>
-      <GeneratedBadge state={review[section]} />
-      {canEdit && <Button size="sm" variant="tertiary" icon={<Check />} onClick={() => approve(section)}>Approve</Button>}
+      <GeneratedBadge state={review[section] ?? "generated"} />
+      {reviewer && canEdit && <Button size="sm" variant="tertiary" icon={<Check />} onClick={() => approve(section)}>Approve</Button>}
     </>
   ) : null;
 
@@ -100,6 +130,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         <section>
           <SectionHeading id="impact" actions={<>
             <ReviewBar section="impact" />
+            <ReviewBar section="claims" />
             {canEdit && <Button size="sm" variant="tertiary" icon={<Pencil />} onClick={() => setEditing("impact")}>Edit</Button>}
           </>}>Impact</SectionHeading>
           <div className="reading space-y-3 text-body-lg">
@@ -143,7 +174,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
                     {items.map((r, i) => (
                       <li key={i} className="flex gap-3 text-body-lg">
                         <span className="mt-1.5 size-3.5 shrink-0 rounded-xs border border-line-hover" aria-hidden />
-                        <span>{r.action}<SourceRefs ids={r.source_ids} sources={sources} /> <Chip className="ml-1 align-middle">{r.owner_role}</Chip></span>
+                        <span>{r.action}<SourceRefs ids={r.source_ids} sources={sources} />{isEdited(r) && <EditedMark />} <Chip className="ml-1 align-middle">{r.owner_role}</Chip></span>
                       </li>
                     ))}
                   </ul>
@@ -160,30 +191,14 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
 
         {rec.vulnerabilities.length > 0 && (
           <section>
-            <SectionHeading id="vulnerabilities">Vulnerabilities</SectionHeading>
-            <div className="overflow-x-auto rounded-md border border-line">
-              <table className="tl-table tl-compact w-full">
-                <thead><tr><th>CVE</th><th className="num">CVSS</th><th>KEV added</th><th>Affected products</th><th>Patch</th><th>Sources</th></tr></thead>
-                <tbody>
-                  {rec.vulnerabilities.map((v) => (
-                    <tr key={v.cve}>
-                      <td><a href={`https://nvd.nist.gov/vuln/detail/${v.cve}`} target="_blank" rel="noopener noreferrer" className="font-mono text-accent-text hover:underline">{v.cve}</a></td>
-                      <td className="num font-semibold">{v.cvss || "—"}</td>
-                      <td>{v.kev_added ?? <span className="text-fg-faint">—</span>}</td>
-                      <td className="min-w-[220px]">{v.affected_products.join(", ") || "—"}</td>
-                      <td className="font-mono text-mono-sm">{v.patch_kb.join(", ") || "—"}</td>
-                      <td><SourceRefs ids={v.source_ids} sources={sources} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <SectionHeading id="vulnerabilities" actions={<ReviewBar section="vulnerabilities" />}>Vulnerabilities</SectionHeading>
+            <VulnTable d={d} canEdit={canEdit} onRefreshed={reload} />
           </section>
         )}
 
         {rec.threat_actors.length > 0 && (
           <section>
-            <SectionHeading id="actors">Threat actors</SectionHeading>
+            <SectionHeading id="actors" actions={<ReviewBar section="threat_actors" />}>Threat actors</SectionHeading>
             <div className="grid gap-3 md:grid-cols-2">
               {rec.threat_actors.map((a) => (
                 <div key={a.name} className="rounded-md border border-line bg-surface p-4">
@@ -201,19 +216,29 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
 
         {rec.attack_paths.length > 0 && (
           <section>
-            <SectionHeading id="attack-paths" actions={<ReviewBar section="attack_paths" />}>Attack paths</SectionHeading>
+            <SectionHeading id="attack-paths" actions={<>
+              <ReviewBar section="attack_paths" />
+              {editable && <Button size="sm" variant="tertiary" icon={<Plus />} onClick={() => setPathEdit({ path: null })}>Add path</Button>}
+            </>}>Attack paths</SectionHeading>
             <div className="space-y-4">
-              {rec.attack_paths.map((p) => (
+              {rec.attack_paths.map((p, pi) => (
                 <div key={p.id} className="rounded-md border border-line bg-surface p-4">
-                  <h3 className="text-h4 font-semibold break-words"><span className="font-mono text-mono-sm text-fg-muted">{p.id}</span> · {p.name}</h3>
+                  <div className="flex flex-wrap items-start gap-2">
+                    <h3 className="min-w-0 flex-1 text-h4 font-semibold break-words"><span className="font-mono text-mono-sm text-fg-muted">{p.id}</span> · {p.name}{isEdited(p) && <EditedMark />}</h3>
+                    {editable && <Button size="sm" variant="tertiary" icon={<Pencil />} onClick={() => setPathEdit({ path: p })} aria-label={`Edit attack path ${p.id}`}>Edit</Button>}
+                  </div>
                   <ol className="mt-3 space-y-2">
-                    {p.steps.map((s) => (
-                      <li key={s.ref} className="flex items-start gap-3">
-                        <span className="mt-0.5 w-12 shrink-0 font-mono text-mono-sm text-fg-muted">{s.ref}</span>
-                        <span className="min-w-0 flex-1 text-[14px] break-words [overflow-wrap:anywhere]">{s.behaviour}<SourceRefs ids={s.source_ids} sources={sources} /></span>
-                        <AttackChip id={s.technique_id} />
-                      </li>
-                    ))}
+                    {p.steps.map((s, si) => {
+                      const flag = flagged.get(`attack_paths:${pi}:${si}`);
+                      return (
+                        <li key={s.ref || si} className={clsx("flex items-start gap-3", flag === "block" && "-mx-2 rounded-sm bg-danger-soft px-2 py-1")}>
+                          <span className="mt-0.5 w-12 shrink-0 font-mono text-mono-sm text-fg-muted">{s.ref}</span>
+                          <span className="min-w-0 flex-1 text-[14px] break-words [overflow-wrap:anywhere]">{s.behaviour}<SourceRefs ids={s.source_ids} sources={sources} />{isEdited(s) && <EditedMark />}</span>
+                          {s.technique_id && <AttackChip id={s.technique_id} />}
+                        </li>
+                      );
+                    })}
+                    {!p.steps.length && <li className="text-body-sm text-fg-muted">No steps yet.</li>}
                   </ol>
                 </div>
               ))}
@@ -225,8 +250,10 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
           <SectionHeading id="mitre" actions={<>
             {tacticFilter && <Badge tone="accent">Filtered to one tactic</Badge>}
             <ReviewBar section="mitre" />
+            {editable && <Button size="sm" variant="tertiary" icon={<Plus />} onClick={() => setMitreEdit({})}>Add technique</Button>}
           </>}>MITRE ATT&amp;CK</SectionHeading>
-          <MitreTable rows={mitre} sources={sources} canEdit={canEdit} onRemove={(tid) => patchRecord({ mitre: rec.mitre.filter((m) => m.technique_id !== tid) }, `Removed ${tid}`)} />
+          <MitreTable rows={mitre} sources={sources} canEdit={editable} flagOf={(m) => flagged.get(`mitre:${rec.mitre.indexOf(m)}`)}
+            onEdit={(m) => setMitreEdit({ row: m, index: rec.mitre.indexOf(m) })} onRemove={removeMitre} />
         </section>
 
         {rec.detection_opportunities.length > 0 && (
@@ -269,7 +296,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         )}
 
         <section>
-          <SectionHeading id="tools">Tools used</SectionHeading>
+          <SectionHeading id="tools" actions={<ReviewBar section="malware_tools" />}>Tools used</SectionHeading>
           {rec.tools_used.length ? (
             <ul className="flex flex-wrap gap-2">{rec.tools_used.map((t) => <li key={t.name}><Chip title={t.detail}>{t.name}</Chip></li>)}</ul>
           ) : <p className="text-fg-muted">None recorded.</p>}
@@ -338,7 +365,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         </section>
 
         <section>
-          <SectionHeading id="industries">Industries</SectionHeading>
+          <SectionHeading id="industries" actions={<ReviewBar section="industries" />}>Industries</SectionHeading>
           <div className="flex flex-wrap gap-2">
             {rec.industries.map((i) => <span key={i.industry} className="inline-flex max-w-full items-center"><Chip title={`${i.evidence} · ${i.source_ids.join(", ")}`}>{i.industry} <span className="text-fg-muted">· {i.evidence}</span></Chip><SourceRefs ids={i.source_ids} sources={sources} /></span>)}
             {!rec.industries.length && <p className="text-fg-muted">No targeted industries identified.</p>}
@@ -414,6 +441,8 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         )}
       </aside>
 
+      <MitreDialog open={!!mitreEdit} onClose={() => setMitreEdit(null)} rid={d.id} sources={rec.sources} row={mitreEdit?.row} index={mitreEdit?.index} onSaved={reload} />
+      <AttackPathDialog open={!!pathEdit} onClose={() => setPathEdit(null)} rid={d.id} path={pathEdit?.path ?? null} sources={rec.sources} onSaved={reload} />
       <EditSummaryDialog open={editing === "summary"} onClose={() => setEditing(null)} value={rec.executive_summary}
         onSave={async (v) => { await patchRecord({ executive_summary: v }, "Edited executive summary"); setEditing(null); }} />
       <EditImpactDialog open={editing === "impact"} onClose={() => setEditing(null)} rec={rec}
@@ -424,24 +453,37 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
   );
 }
 
-function MitreTable({ rows, sources, canEdit, onRemove }: { rows: MitreRow[]; sources: Record<string, ResearchRecord["sources"][number]>; canEdit: boolean; onRemove: (tid: string) => void }) {
+function MitreTable({ rows, sources, canEdit, onEdit, onRemove, flagOf }: {
+  rows: MitreRowE[]; sources: Record<string, ResearchRecord["sources"][number]>; canEdit: boolean;
+  onEdit: (m: MitreRowE) => void; onRemove: (m: MitreRowE) => void; flagOf: (m: MitreRowE) => "block" | "warn" | undefined;
+}) {
   if (!rows.length) return <p className="text-fg-muted">No techniques mapped.</p>;
   return (
     <div className="overflow-x-auto rounded-md border border-line">
       <table className="tl-table tl-compact w-full">
-        <thead><tr><th>Tactic</th><th>Technique</th><th>Procedure</th><th>Evidence</th><th>Confidence</th><th>Sources</th>{canEdit && <th className="w-8"><span className="sr-only">Actions</span></th>}</tr></thead>
+        <thead><tr><th>Tactic</th><th>Technique</th><th>Procedure</th><th>Evidence</th><th>Confidence</th><th>Sources</th>{canEdit && <th className="w-16"><span className="sr-only">Actions</span></th>}</tr></thead>
         <tbody>
-          {rows.map((m) => (
-            <tr key={m.technique_id + m.tactic_id}>
-              <td className="whitespace-nowrap">{m.tactic}</td>
-              <td className="min-w-[200px]"><AttackChip id={m.technique_id} name={m.sub_technique || m.technique} tactic={m.tactic} /></td>
-              <td className="min-w-[220px]">{m.procedure}</td>
-              <td className="min-w-[200px]">{m.evidence_quote ? <Quote>{m.evidence_quote}</Quote> : <span className="text-fg-faint">—</span>}</td>
-              <td>{m.confidence.charAt(0).toUpperCase() + m.confidence.slice(1)}</td>
-              <td><SourceRefs ids={m.source_ids} sources={sources} /></td>
-              {canEdit && <td><button onClick={() => onRemove(m.technique_id)} aria-label={`Remove ${m.technique_id}`} className="grid size-7 place-items-center rounded-sm text-fg-muted hover:bg-danger-soft hover:text-danger"><Trash2 className="size-4" /></button></td>}
-            </tr>
-          ))}
+          {rows.map((m) => {
+            const flag = flagOf(m);
+            return (
+              <tr key={m.technique_id + m.tactic_id} className={clsx(flag === "block" && "bg-danger-soft")}>
+                <td className="whitespace-nowrap">{m.tactic}</td>
+                <td className="min-w-[200px]"><AttackChip id={m.technique_id} name={m.sub_technique || m.technique} tactic={m.tactic} />{isEdited(m) && <EditedMark />}</td>
+                <td className="min-w-[220px]">{m.procedure}</td>
+                <td className="min-w-[200px]">{m.evidence_quote ? <Quote>{m.evidence_quote}</Quote> : <span className="text-fg-faint">—</span>}</td>
+                <td>{m.confidence ? m.confidence.charAt(0).toUpperCase() + m.confidence.slice(1) : "—"}</td>
+                <td><SourceRefs ids={m.source_ids} sources={sources} /></td>
+                {canEdit && (
+                  <td>
+                    <div className="flex items-center gap-0.5">
+                      <button onClick={() => onEdit(m)} aria-label={`Edit ${m.technique_id}`} className="grid size-7 place-items-center rounded-sm text-fg-muted hover:bg-subtle hover:text-fg"><Pencil className="size-4" /></button>
+                      <button onClick={() => onRemove(m)} aria-label={`Remove ${m.technique_id}`} className="grid size-7 place-items-center rounded-sm text-fg-muted hover:bg-danger-soft hover:text-danger"><Trash2 className="size-4" /></button>
+                    </div>
+                  </td>
+                )}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
