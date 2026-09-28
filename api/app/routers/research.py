@@ -16,9 +16,9 @@ from ..db import get_db
 from ..deps import REVIEW_ROLES, current_user, iso, research_summary, user_dict, workspace_dict
 from ..exports import context as export_ctx
 from ..exports import render
-from ..models import ActivityEvent, ExportLog, Research, ResearchVersion, Result, Run, RunLog, User, Workspace
+from ..models import ActivityEvent, ExportLog, Query, Research, ResearchVersion, Result, Run, RunLog, User, Workspace
 from ..pipeline import runner
-from ..records import log_activity, new_research_id, save_record, tactic_rail
+from ..records import backfill_provenance, log_activity, new_research_id, save_record, tactic_rail
 
 router = APIRouter(prefix="/api/research", tags=["research"])
 
@@ -148,6 +148,7 @@ class NewRun(BaseModel):
     open_web: bool = True
     depth: str = "standard"
     lookback_days: int = 30
+    include_generic_hunts: bool = False  # generic (not threat-specific) TTP hunts are opt-in and capped
     tlp: str = "AMBER"
     draft: bool = False
     offline: bool = False
@@ -208,7 +209,8 @@ def get_research(rid: str, db: Session = Depends(get_db), ws: str | None = None)
             related.append({"id": o.id, "title": o.title, "severity": o.severity, "status": o.status})
     return {
         **research_summary(r, results, users, ws),
-        "record": r.record, "seed": r.seed,
+        # Records saved before queries/opportunities carried a source trail get it filled in on read.
+        "record": backfill_provenance(copy.deepcopy(r.record or {})), "seed": r.seed,
         "reviewed_by": user_dict(users.get(r.reviewed_by)),
         "results": [{"workspace_id": x.workspace_id, "status": x.status, "summary": x.summary, "hunt_window": x.hunt_window,
                      "queries_run": x.queries_run, "analyst": user_dict(users.get(x.analyst_id)), "updated_at": iso(x.updated_at)} for x in results],
@@ -263,12 +265,24 @@ class ReviewMark(BaseModel):
     state: str = "approved"
 
 
+REVIEW_STATES = ("generated", "edited", "approved")
+
+
 @router.post("/{rid}/review")
 def mark_review(rid: str, body: ReviewMark, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Mark one report section's review state. Reviewers, leads and admins only (403 otherwise)."""
+    if user.role not in REVIEW_ROLES:
+        raise HTTPException(403, "Only reviewers, leads and admins can mark sections as reviewed.")
+    if body.state not in REVIEW_STATES:
+        raise HTTPException(422, f"Invalid review state. Use one of: {', '.join(REVIEW_STATES)}.")
     r = _get(db, rid)
+    if r.status == "archived":
+        raise HTTPException(409, "Archived research is read-only. Restore it first.")
     rec = copy.deepcopy(r.record or {})
     rec.setdefault("review", {})[body.section] = body.state
     r.record = rec
+    log_activity(db, rid, "edited", f"Section {body.section.replace('_', ' ')} marked {body.state} by {user.name}", user.id,
+                 section=body.section)
     db.commit()
     return {"review": rec["review"]}
 
@@ -292,8 +306,9 @@ def change_status(rid: str, body: StatusChange, db: Session = Depends(get_db), u
     elif body.action == "publish":
         if user.role not in REVIEW_ROLES:
             raise HTTPException(403, "Only reviewers, leads and admins can publish. Submit for review instead.")
-        if r.status not in ("in_review", "draft"):
-            raise HTTPException(409, f"Cannot publish from status {r.status}.")
+        if r.status != "in_review":
+            hint = " Submit it for review first." if r.status in ("draft", "failed") else ""
+            raise HTTPException(409, f"Only research in review can be published (status is {r.status}).{hint}")
         blockers = []
         disputed = [c for c in rec.get("conflicts", []) if c.get("status") == "disputed"]
         if disputed:
@@ -309,8 +324,9 @@ def change_status(rid: str, body: StatusChange, db: Session = Depends(get_db), u
         new = copy.deepcopy(rec)
         new["status"] = "published"
         new["review"] = {k: "approved" for k in new.get("review", {})}
-        r.record = new
         msg = f"Published by {user.name}"
+        # Publishing is a versioned edit like any other: it writes a ResearchVersion row (and re-syncs the libraries).
+        save_record(db, r, new, user.id, msg + (f": {body.note}" if body.note else ""))
     elif body.action == "archive":
         r.status = "archived"
         msg = f"Archived by {user.name}"
@@ -408,24 +424,72 @@ class QueryPatch(BaseModel):
     fp_notes: str | None = None
 
 
+@router.get("/{rid}/queries")
+def list_queries(rid: str, db: Session = Depends(get_db), ws: str | None = None, platform: str | None = None,
+                 group: str | None = None, include_reference: bool = True):
+    """The research's hunt queries. With `ws=<workspace id>` each query also carries that workspace's field mappings
+    applied server-side: `mapped_body`, `mapped_lint` (lint re-run on the mapped text) and `mapping_applied`."""
+    r = _get(db, rid)
+    w = None
+    if ws and ws != "all":
+        w = db.get(Workspace, ws)
+        if w is None:
+            raise HTTPException(404, "Workspace not found")
+    rec = backfill_provenance(copy.deepcopy(r.record or {}))
+    items = []
+    for q in (rec.get("hunts") or {}).get("queries", []):
+        if platform and q.get("platform") != platform:
+            continue
+        if group and q.get("group") != group:
+            continue
+        if not include_reference and q.get("origin") == "reference":
+            continue
+        items.append({**q, **(detection.map_query(q, w.field_mappings or {}) if w else {})})
+    return {"research_id": rid, "workspace_id": w.id if w else None,
+            "field_mappings": (w.field_mappings or {}) if w else None, "statuses": detection.QUERY_STATUSES,
+            "total": len(items), "items": items}
+
+
+def _record_query(r: Research, qid: str) -> dict | None:
+    return next((x for x in (r.record or {}).get("hunts", {}).get("queries", []) if x["id"] == qid), None)
+
+
 @router.patch("/{rid}/queries/{qid}")
 def patch_query(rid: str, qid: str, body: QueryPatch, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Edit a query body / fp notes or move its status (detection.QUERY_STATUSES). 422 for an unknown status; 409 when
+    the status needs a clean lint (syntax_checked and later) but the query fails lint, or for misuse of 'reference'."""
     r = _get(db, rid)
+    if r.status == "archived":
+        raise HTTPException(409, "Archived research is read-only. Restore it first.")
     rec = copy.deepcopy(r.record or {})
     for q in rec.get("hunts", {}).get("queries", []):
         if q["id"] == qid:
+            origin = q.get("origin", "generated")
+            new_body = body.body if body.body is not None else q.get("body", "")
+            issues = [] if origin == "reference" else detection.lint(q["platform"], new_body, q.get("techniques"))
+            if body.status:
+                why = detection.check_status_change(body.status, origin=origin, lint_issues=issues)
+                if why:
+                    raise HTTPException(422 if "Unknown query status" in why else 409, why)
             if body.body is not None:
                 q["body"] = body.body
-                q["lint"] = detection.lint(q["platform"], body.body)
-                q["status"] = "syntax_checked" if not q["lint"] else "generated"
+                q["lint"] = issues
+                if origin != "reference":
+                    q["status"] = "syntax_checked" if not issues else "generated"
             if body.status:
                 q["status"] = body.status
             if body.fp_notes is not None:
                 q["fp_notes"] = body.fp_notes
             save_record(db, r, rec, user.id, f"Query {qid} updated")
+            saved = _record_query(r, qid) or q
+            # sync_library keeps the more advanced status; an explicit change here (including a demotion, or a body
+            # edit that resets the status) is authoritative for the library row too.
+            row = db.get(Query, qid)
+            if row is not None and (body.status or body.body is not None):
+                row.status = saved.get("status", row.status)
             log_activity(db, rid, "edited", f"Query {qid} {('marked ' + body.status) if body.status else 'edited'} by {user.name}", user.id)
             db.commit()
-            return q
+            return saved
     raise HTTPException(404, "Query not found")
 
 
@@ -459,6 +523,7 @@ class Rerun(BaseModel):
     from_stage: str = "synthesis"
     platforms: list[str] | None = None
     workspace_ids: list[str] | None = None
+    include_generic_hunts: bool | None = None
 
 
 @router.post("/{rid}/rerun")
@@ -479,7 +544,11 @@ def rerun(rid: str, body: Rerun, db: Session = Depends(get_db), user: User = Dep
         cfg.setdefault("excluded_sources", [])
         if body.platforms:
             cfg["platforms"] = body.platforms
-        cfg.setdefault("platforms", ["spl", "kql_defender", "sigma"])
+        if body.include_generic_hunts is not None:
+            cfg["include_generic_hunts"] = body.include_generic_hunts
+        if not cfg.get("platforms"):
+            from ..pipeline.stages import workspace_platforms
+            cfg["platforms"] = workspace_platforms(db, cfg.get("workspace_ids") or r.workspace_ids)
         run = Run(id=f"RUN-{rid}-{uuid.uuid4().hex[:6]}", research_id=rid, seed=r.seed, config=cfg,
                   mode="llm" if llm.available() else "offline", stage_status={s: {"state": "pending"} for s in runner.STAGE_IDS})
         db.add(run)
@@ -490,6 +559,8 @@ def rerun(rid: str, body: Rerun, db: Session = Depends(get_db), user: User = Dep
         cfg = dict(run.config or {})
         if body.platforms:
             cfg["platforms"] = body.platforms
+        if body.include_generic_hunts is not None:
+            cfg["include_generic_hunts"] = body.include_generic_hunts
         if body.workspace_ids:
             cfg["workspace_ids"] = body.workspace_ids
             r.workspace_ids = body.workspace_ids

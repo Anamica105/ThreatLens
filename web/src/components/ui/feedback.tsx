@@ -85,9 +85,9 @@ export function Banner({ tone = "info", children, action }: { tone?: AlertTone; 
 export function EmptyState({ icon, title, body, action }: { icon: React.ReactNode; title: string; body?: React.ReactNode; action?: React.ReactNode }) {
   return (
     <div className="mx-auto flex max-w-[400px] flex-col items-center px-4 py-12 text-center">
-      <span className="mb-3 text-fg-faint [&_svg]:size-6">{icon}</span>
-      <h3 className="text-h3 font-semibold">{title}</h3>
-      {body && <p className="mt-1 text-fg-muted">{body}</p>}
+      <span className="mb-4 grid size-12 place-items-center rounded-full bg-subtle text-fg-faint [&_svg]:size-6">{icon}</span>
+      <h3 className="text-h3 font-semibold text-balance">{title}</h3>
+      {body && <p className="mt-1 text-fg-muted text-pretty">{body}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );

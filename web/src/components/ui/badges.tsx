@@ -28,11 +28,11 @@ export function Pill({ tone, children, dot = true, running, outline, icon, class
   return (
     <span
       title={title}
-      className={clsx("inline-flex h-[22px] items-center gap-1.5 rounded-full px-2 text-[12px] font-semibold leading-none whitespace-nowrap", className)}
+      className={clsx("inline-flex h-[22px] max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-full px-2 text-[12px] font-semibold leading-none whitespace-nowrap", className)}
       style={{ background: outline ? "transparent" : t.bg, color: t.fg, boxShadow: outline ? `inset 0 0 0 1px ${t.dot}` : undefined }}
     >
-      {icon ? <span className="[&_svg]:size-3.5">{icon}</span> : dot && <span className={clsx("size-1.5 rounded-full", running && "dot-running")} style={{ background: t.dot }} />}
-      {children}
+      {icon ? <span className="shrink-0 [&_svg]:size-3.5">{icon}</span> : dot && <span className={clsx("size-1.5 shrink-0 rounded-full", running && "dot-running")} style={{ background: t.dot }} />}
+      <span className="min-w-0 truncate">{children}</span>
     </span>
   );
 }
@@ -61,10 +61,11 @@ export function Badge({ tone = "neutral", children, square, className, title, mo
   { tone?: Tone; children: React.ReactNode; square?: string; className?: string; title?: string; mono?: boolean }) {
   const t = TONE[tone];
   return (
-    <span title={title} className={clsx("inline-flex h-[22px] items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none whitespace-nowrap", mono && "font-mono", className)}
+    <span title={title ?? (typeof children === "string" ? children : undefined)}
+      className={clsx("inline-flex h-[22px] max-w-full min-w-0 shrink-0 items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none whitespace-nowrap", mono && "font-mono", className)}
       style={{ background: t.bg, color: t.fg }}>
-      {square && <span className="size-2 rounded-[1px]" style={{ background: square }} />}
-      {children}
+      {square && <span className="size-2 shrink-0 rounded-[1px]" style={{ background: square }} />}
+      <span className="min-w-0 truncate">{children}</span>
     </span>
   );
 }
@@ -72,7 +73,7 @@ export function Badge({ tone = "neutral", children, square, className, title, mo
 export function SeverityBadge({ severity, className }: { severity: Severity; className?: string }) {
   const s = SEVERITY[severity] ?? SEVERITY.medium;
   return (
-    <span className={clsx("inline-flex h-[22px] items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none", className)}
+    <span className={clsx("inline-flex h-[22px] shrink-0 items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none whitespace-nowrap", className)}
       style={{ background: s.soft, color: s.text }}>
       <span className="size-2 rounded-[1px]" style={{ background: s.solid }} />
       {s.label}
@@ -82,7 +83,7 @@ export function SeverityBadge({ severity, className }: { severity: Severity; cla
 
 export function TlpBadge({ tlp }: { tlp: string }) {
   return (
-    <span className="inline-flex h-[22px] items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none"
+    <span className="inline-flex h-[22px] shrink-0 items-center gap-1.5 rounded-sm px-2 text-[12px] font-semibold leading-none whitespace-nowrap"
       style={{ background: "var(--tlp-badge-bg)", color: "var(--tlp-badge-text)" }}>
       <span className="size-2 rounded-[1px]" style={{ background: TLP_SQUARE[tlp] ?? "var(--tlp-amber)", border: tlp === "CLEAR" ? "1px solid var(--tlp-clear-border)" : undefined }} />
       TLP:{tlp}
@@ -104,7 +105,7 @@ export function VerdictBadge({ verdict, compact }: { verdict: Verdict; compact?:
       </Tooltip>
     );
   return (
-    <span className="inline-flex h-5 items-center gap-1 rounded-sm px-1.5 text-[12px] font-semibold leading-none [&_svg]:size-3.5" style={{ background: t.bg, color: t.fg }}>
+    <span className="inline-flex h-5 shrink-0 items-center gap-1 rounded-sm px-1.5 text-[12px] font-semibold leading-none whitespace-nowrap [&_svg]:size-3.5 [&_svg]:shrink-0" style={{ background: t.bg, color: t.fg }}>
       {VERDICT_ICON[verdict]}
       {v.label}
     </span>
@@ -137,26 +138,28 @@ export function Chip({ children, href, dot, icon, className, title, onRemove, mo
   const inner = (
     <>
       {dot && <span className="size-2 rounded-full shrink-0" style={{ background: dot }} />}
-      {icon && <span className="[&_svg]:size-3.5 text-fg-muted">{icon}</span>}
-      <span className={clsx("truncate", mono && "font-mono text-[12px]")}>{children}</span>
+      {icon && <span className="shrink-0 text-fg-muted [&_svg]:size-3.5">{icon}</span>}
+      <span className={clsx("min-w-0 truncate", mono && "font-mono text-[12px]")}>{children}</span>
       {onRemove && (
         <button type="button" onClick={onRemove} aria-label={`Remove ${typeof children === "string" ? children : ""}`}
-          className="-mr-1 ml-0.5 grid size-4 place-items-center rounded-sm text-fg-muted hover:bg-[var(--g-100)] hover:text-fg dark:hover:bg-[#2E3440]">×</button>
+          className="-mr-1 ml-0.5 grid size-4 shrink-0 place-items-center rounded-sm text-fg-muted hover:bg-[var(--g-100)] hover:text-fg dark:hover:bg-[#2E3440]">×</button>
       )}
     </>
   );
-  const cls = clsx("inline-flex h-6 max-w-[260px] items-center gap-1.5 rounded-sm bg-chip px-2 text-[13px] font-medium text-chip-fg", href && "hover:bg-[var(--g-100)] dark:hover:bg-[#2E3440]", className);
-  if (href) return <Link href={href} className={cls} title={title}>{inner}</Link>;
-  return <span className={cls} title={title}>{inner}</span>;
+  const cls = clsx("inline-flex h-6 max-w-full min-w-0 items-center gap-1.5 rounded-sm bg-chip px-2 text-[13px] font-medium whitespace-nowrap text-chip-fg transition-colors duration-[var(--motion-instant)]", href && "hover:bg-[var(--g-100)] dark:hover:bg-[#2E3440]", className);
+  const tip = title ?? (typeof children === "string" ? children : undefined);
+  if (href) return <Link href={href} className={cls} title={tip}>{inner}</Link>;
+  return <span className={cls} title={tip}>{inner}</span>;
 }
 
 export function AttackChip({ id, name, tactic, href }: { id: string; name?: string; tactic?: string; href?: string }) {
   const body = (
-    <span className="inline-flex h-6 items-center gap-1.5 rounded-sm bg-chip px-2 text-[13px] text-chip-fg">
-      <span className="font-mono text-[12px] font-semibold text-accent-text">{id}</span>
-      {name && <span className="max-w-[220px] truncate">{name}</span>}
+    <span className="inline-flex h-6 max-w-full min-w-0 items-center gap-1.5 rounded-sm bg-chip px-2 text-[13px] whitespace-nowrap text-chip-fg transition-colors duration-[var(--motion-instant)] hover:bg-[var(--g-100)] dark:hover:bg-[#2E3440]">
+      <span className="shrink-0 font-mono text-[12px] font-semibold text-accent-text">{id}</span>
+      {name && <span className="min-w-0 truncate">{name}</span>}
     </span>
   );
+  const label = name ? `${id} ${name}` : id;
   const tip = (
     <span>
       {tactic ? `${tactic} · ` : ""}{name ?? id}
@@ -166,7 +169,7 @@ export function AttackChip({ id, name, tactic, href }: { id: string; name?: stri
   );
   return (
     <Tooltip content={tip}>
-      {href ? <Link href={href}>{body}</Link> : <a href={`https://attack.mitre.org/techniques/${id.replace(".", "/")}/`} target="_blank" rel="noopener noreferrer">{body}</a>}
+      {href ? <Link href={href} className="inline-flex max-w-full min-w-0" aria-label={label}>{body}</Link> : <a className="inline-flex max-w-full min-w-0" aria-label={label} href={`https://attack.mitre.org/techniques/${id.replace(".", "/")}/`} target="_blank" rel="noopener noreferrer">{body}</a>}
     </Tooltip>
   );
 }
@@ -174,9 +177,9 @@ export function AttackChip({ id, name, tactic, href }: { id: string; name?: stri
 export function PlatformChip({ name, status }: { name: string; status?: string }) {
   const tone = status ? (QUERY_STATUS[status]?.tone ?? "neutral") : null;
   return (
-    <span className="inline-flex h-6 items-center gap-1.5 rounded-sm bg-chip px-2 text-[12px] font-semibold text-chip-fg">
-      {tone && <span className="size-1.5 rounded-full" style={{ background: TONE[tone].dot }} />}
-      {name}
+    <span title={name} className="inline-flex h-6 max-w-full min-w-0 items-center gap-1.5 rounded-sm bg-chip px-2 text-[12px] font-semibold whitespace-nowrap text-chip-fg">
+      {tone && <span className="size-1.5 shrink-0 rounded-full" style={{ background: TONE[tone].dot }} />}
+      <span className="min-w-0 truncate">{name}</span>
     </span>
   );
 }
@@ -184,7 +187,7 @@ export function PlatformChip({ name, status }: { name: string; status?: string }
 export function ConfidenceBadge({ level }: { level: string }) {
   const n = level === "high" ? 3 : level === "moderate" ? 2 : 1;
   return (
-    <span className="inline-flex h-[22px] items-center gap-1.5 rounded-sm bg-chip px-2 text-[12px] font-semibold text-chip-fg">
+    <span className="inline-flex h-[22px] shrink-0 items-center gap-1.5 rounded-sm bg-chip px-2 text-[12px] font-semibold whitespace-nowrap text-chip-fg">
       <span className="flex items-end gap-[2px]" aria-hidden>
         {[1, 2, 3].map((i) => (
           <span key={i} className="w-[3px] rounded-[1px]" style={{ height: 4 + i * 2, background: i <= n ? "var(--text-strong)" : "var(--g-300)" }} />

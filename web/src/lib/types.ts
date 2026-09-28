@@ -37,6 +37,19 @@ export interface Query {
   id: string; type: "ioc" | "ioa" | "vuln" | "ttp"; title: string; platform: string; body: string; opportunity_id: string | null;
   techniques: string[]; fp_notes: string; data_sources: string[]; log_sources: string[]; status: string; lint: string[];
   origin: "generated" | "reference"; sigma_ref: string | null;
+  /** Backend contract (optional until reseeded): sources the detection was derived from. */
+  source_ids?: string[];
+  /** vendor = published by a source verbatim; derived = built from source evidence; generic = wider technique hunt. */
+  provenance?: Provenance;
+  /** All platform variants (Sigma, SPL, KQL…) of the same detection logic share one group, e.g. "DET-1". */
+  group?: string;
+}
+
+export type Provenance = "vendor" | "derived" | "generic";
+
+/** Library detail endpoints: where an entity came from. */
+export interface ProvenanceItem {
+  research_id: string; research_title?: string; source_id: string; publisher?: string; title?: string; url?: string; quote?: string;
 }
 
 export interface MitreRow {
@@ -57,7 +70,7 @@ export interface Source {
 
 export interface Opportunity {
   id: string; behaviour_ref: string; title: string; logic: string; type: string; techniques: string[]; fp_notes: string;
-  data_sources: string[]; queries: string[]; spec: unknown;
+  data_sources: string[]; queries: string[]; spec: unknown; source_ids?: string[];
 }
 
 export interface AttackPath { id: string; name: string; steps: { ref: string; behaviour: string; technique_id: string; source_ids: string[] }[] }

@@ -4,11 +4,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import attack
+from . import attack, audit
 from .config import get_settings
 from .db import Base, SessionLocal, engine
 from .models import Run
-from .routers import dashboard, library, misc, research, runs
+from .routers import dashboard, enrichment, library, misc, research, runs
 from .seed import seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -24,7 +24,9 @@ app = FastAPI(title="ThreatLens API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[get_settings().web_base_url, "http://localhost:3000", "http://127.0.0.1:3000"],
                    allow_methods=["*"], allow_headers=["*"], expose_headers=["Content-Disposition"])
 
-for r in (research.router, runs.router, library.router, dashboard.router, misc.router):
+app.add_middleware(audit.ViewAuditMiddleware)
+
+for r in (research.router, runs.router, library.router, dashboard.router, misc.router, enrichment.router, audit.router):
     app.include_router(r)
 
 

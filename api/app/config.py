@@ -27,6 +27,24 @@ class Settings(BaseSettings):
     run_workers: int = 2
     fetch_timeout: float = 20.0
 
+    # CVE enrichment (NVD 2.0, CISA KEV, FIRST EPSS). Only CVE ids are ever sent.
+    cve_enrichment: bool = True
+    nvd_api_key: str = ""
+    cve_cache_hours: int = 24
+    enrichment_timeout: float = 10.0
+
+    # Run budget per depth (spec section 12): wall-clock minutes and LLM tokens.
+    run_budgets: dict = {
+        "quick": {"max_minutes": 5, "max_tokens": 250_000},
+        "standard": {"max_minutes": 10, "max_tokens": 600_000},
+        "deep": {"max_minutes": 20, "max_tokens": 1_200_000},
+    }
+    budget_warn_pct: float = 80.0
+    budget_enforce: bool = False  # true: stop the run at the next stage boundary once over budget
+
+    # View audit (spec section 13): one row per user + entity per window.
+    audit_dedupe_minutes: int = 10
+
 
 @lru_cache
 def get_settings() -> Settings:

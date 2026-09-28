@@ -8,7 +8,7 @@ import { useApp } from "../../providers";
 import { QueryStatusPill } from "../../ui/badges";
 import { Button, ButtonGroup } from "../../ui/button";
 import { Select } from "../../ui/forms";
-import type { DetailProps } from "./common";
+import { SourceRefs, type DetailProps } from "./common";
 
 interface Row { id: string; level: number; kind: "ttp" | "behaviour" | "opportunity" | "detection"; label: React.ReactNode; meta?: React.ReactNode; right?: React.ReactNode; parent?: string; hasKids: boolean; tactic?: string }
 
@@ -19,6 +19,7 @@ export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: strin
   const [open, setOpen] = useState<Set<string>>(new Set());
   const [tactic, setTactic] = useState<string>(tacticFilter ?? "");
 
+  const sources = useMemo(() => Object.fromEntries(rec.sources.map((x) => [x.id, x])), [rec.sources]);
   const rows = useMemo(() => {
     const out: Row[] = [];
     const steps = rec.attack_paths.flatMap((p) => p.steps);
@@ -31,19 +32,20 @@ export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: strin
       const opps = rec.detection_opportunities.filter((o) => bs.some((b) => b.ref === o.behaviour_ref) || (!bs.length && o.techniques.includes(m.technique_id)));
       const nDet = opps.reduce((a, o) => a + rec.hunts.queries.filter((q) => q.opportunity_id === o.id).length, 0);
       const tid = `t-${m.technique_id}`;
+      const tSources = Array.from(new Set(rec.mitre.filter((x) => x.technique_id === m.technique_id).flatMap((x) => x.source_ids)));
       out.push({ id: tid, level: 0, kind: "ttp", hasKids: bs.length > 0, tactic: m.tactic_id,
-        label: <><span className="font-mono text-mono text-accent-text">{m.technique_id}</span> <span>{m.sub_technique || m.technique}</span></>,
+        label: <><span className="font-mono text-mono text-accent-text">{m.technique_id}</span> <span>{m.sub_technique || m.technique}</span><SourceRefs ids={tSources} sources={sources} /></>,
         meta: `${m.tactic} · ${bs.length} behaviour${bs.length === 1 ? "" : "s"} · ${nDet} detection${nDet === 1 ? "" : "s"}` });
       for (const b of bs) {
         const bo = rec.detection_opportunities.filter((o) => o.behaviour_ref === b.ref);
         const bid = `${tid}/b-${b.ref}`;
-        out.push({ id: bid, parent: tid, level: 1, kind: "behaviour", hasKids: bo.length > 0, label: b.behaviour,
+        out.push({ id: bid, parent: tid, level: 1, kind: "behaviour", hasKids: bo.length > 0, label: <>{b.behaviour}<SourceRefs ids={b.source_ids} sources={sources} /></>,
           meta: `${bo.length} detection opportunit${bo.length === 1 ? "y" : "ies"}`, right: <span className="font-mono text-mono-sm text-fg-muted">{b.ref}</span> });
         for (const o of bo) {
           const qs = rec.hunts.queries.filter((q) => q.opportunity_id === o.id);
           const oid = `${bid}/o-${o.id}`;
           out.push({ id: oid, parent: bid, level: 2, kind: "opportunity", hasKids: qs.length > 0,
-            label: <><span className="font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{o.id}</span> {o.title}</>,
+            label: <><span className="font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{o.id}</span> {o.title}<SourceRefs ids={o.source_ids?.length ? o.source_ids : b.source_ids} sources={sources} /></>,
             meta: o.logic });
           out.push({ id: `${oid}/q`, parent: oid, level: 3, kind: "detection", hasKids: false,
             label: <span className="flex flex-wrap items-center gap-x-2">{qs.map((q, i) => <span key={q.id}>{i > 0 && <span className="text-fg-faint">· </span>}{platformName(q.platform, true)}</span>)}</span>,
@@ -52,7 +54,7 @@ export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: strin
       }
     }
     return out;
-  }, [rec, tactic, platformName]);
+  }, [rec, tactic, platformName, sources]);
 
   const visible = rows.filter((r) => {
     let p = r.parent;
@@ -75,7 +77,7 @@ export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: strin
         </ButtonGroup>
         <Select size="sm" className="w-56" value={tactic} onChange={setTactic} ariaLabel="Filter by tactic"
           options={[{ value: "", label: "All tactics" }, ...tactics.map(([id, name]) => ({ value: id, label: name }))]} />
-        <span className="ml-auto text-caption text-fg-muted">{rows.filter((r) => r.kind === "ttp").length} techniques · {rec.detection_opportunities.length} detection opportunities · {rec.hunts.queries.length} queries</span>
+        <span className="text-caption text-fg-muted sm:ml-auto">{rows.filter((r) => r.kind === "ttp").length} techniques · {rec.detection_opportunities.length} detection opportunities · {rec.hunts.queries.length} queries</span>
       </div>
       <div role="treegrid" aria-label="Research hierarchy" className="overflow-hidden rounded-md border border-line bg-surface">
         {visible.map((r) => (
@@ -94,8 +96,8 @@ export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: strin
               <span className="size-1.5 rounded-full" style={{ background: kindLabel[r.kind][1] }} />{kindLabel[r.kind][0]}
             </span>
             <div className="min-w-0 flex-1">
-              <div className={clsx("text-[14px]", r.kind === "behaviour" && "font-mono text-mono")}>{r.label}</div>
-              {r.meta && <div className="text-caption text-fg-muted">{r.meta}</div>}
+              <div className={clsx("text-[14px] break-words [overflow-wrap:anywhere]", r.kind === "behaviour" && "font-mono text-mono")}>{r.label}</div>
+              {r.meta && <div className="text-caption text-fg-muted break-words">{r.meta}</div>}
             </div>
             {r.right}
           </div>

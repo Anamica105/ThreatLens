@@ -11,12 +11,13 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from .. import attack, detection, llm, osint
+from .. import attack, detection, llm, osint, vulns
 from ..config import get_settings
 from ..db import SessionLocal
 from ..ioc import defang, extract as extract_iocs, refang
 from ..models import Actor, Ioc, MalwareTool, Research, Workspace
-from ..records import (applicability, coverage_gaps, ensure_results, log_activity, next_id, save_record)
+from ..records import (applicability, coverage_gaps, ensure_results, log_activity, mitre_source_ids, next_id,
+                       opportunity_source_ids, save_record, sort_sids, spec_key, step_index)
 from ..sources import VENDORS, discover, fetch, relevance, vendor_for_url
 from .runner import STAGES, Ctx, StageWarning
 from . import schemas as SC
@@ -454,6 +455,59 @@ def stage_attack(ctx: Ctx):
 
 # --------------------------------------------------------------------------- 6. Detection reasoning
 
+MAX_OPPS_PER_STEP = 2       # best 1-2 opportunities per attack-path step
+MAX_OPPS_TOTAL = 15
+MAX_GENERIC_HUNTS = 5       # cap on generic (not threat-specific) TTP hunt groups when opted in
+STRONG_CATEGORIES = {"process_creation": 2, "web": 2, "file_event": 1}  # behaviours that survive IoC rotation
+
+
+def select_opportunities(opps: list[dict], paths: list[dict], mitre: list[dict], per_step: int = MAX_OPPS_PER_STEP,
+                         max_total: int = MAX_OPPS_TOTAL) -> list[dict]:
+    """De-duplicate opportunities with the same logic, keep the best `per_step` per attack-path step, number them
+    DO-n and attach data_sources and source_ids."""
+    steps = step_index(paths)
+    merged: dict[str, dict] = {}
+    for o in opps:
+        k = spec_key(o["spec"])
+        if k in merged:  # same logic: keep the first, merge techniques
+            m = merged[k]
+            m["techniques"] = list(dict.fromkeys(m.get("techniques", []) + o.get("techniques", [])))
+            continue
+        merged[k] = {**o, "techniques": list(o.get("techniques", []))}
+    uniq = list(merged.values())
+
+    def score(o: dict) -> float:
+        spec = o["spec"]
+        st = steps.get(o.get("behaviour_ref") or "") or {}
+        s = len(spec.get("conditions", [])) + len({c.get("field") for c in spec.get("conditions", [])}) * 0.5
+        s += STRONG_CATEGORIES.get(spec.get("category"), 0)
+        if st.get("technique_id") and st["technique_id"] in o.get("techniques", []):
+            s += 2
+        if o.get("type") == "ioa":
+            s += 1
+        return s
+
+    by_step: dict[str, list[int]] = {}
+    for idx, o in enumerate(uniq):
+        key = o.get("behaviour_ref") or f"tech:{(o.get('techniques') or [''])[0]}"
+        by_step.setdefault(key, []).append(idx)
+    keep: set[int] = set()
+    for idxs in by_step.values():
+        keep |= set(sorted(idxs, key=lambda i: -score(uniq[i]))[:per_step])
+    if len(keep) > max_total:
+        keep = set(sorted(keep, key=lambda i: -score(uniq[i]))[:max_total])
+    out = []
+    for idx, o in enumerate(uniq):
+        if idx not in keep:
+            continue
+        o = dict(o)
+        o["id"] = f"DO-{len(out) + 1}"
+        o["data_sources"] = [o["spec"]["category"]]
+        o["source_ids"] = opportunity_source_ids(o, steps, mitre)
+        out.append(o)
+    return out
+
+
 def stage_detection(ctx: Ctx):
     syn = ctx.artifacts["synthesis"]
     mitre = ctx.artifacts["attack"]["mitre"]
@@ -464,7 +518,8 @@ def stage_detection(ctx: Ctx):
                     for i, p in enumerate(paths, 1) for j, s in enumerate(p["steps"], 1)]
         res, tok = llm.structured(
             SC.OpportunityList,
-            "For each attack-path step below, write the behavioural detection opportunities a hunter can act on. Prefer "
+            "For each attack-path step below, write the one or two best behavioural detection opportunities a hunter can act "
+            "on (never more than two per step, and never two with the same logic). Prefer "
             "behaviours that survive indicator rotation (process lineage, HTTP request shape, file writes in unusual paths). "
             "For each, express the logic as a neutral detection spec using only these fields: parent_image, grandparent_image, "
             "image, command_line (process_creation); target_filename (file_event); http_method, url_path, referer, user_agent, "
@@ -484,9 +539,10 @@ def stage_detection(ctx: Ctx):
             for t in TECHNIQUE_OPPORTUNITIES.get(tid, []):
                 if t["type"] == "ioa":
                     opps.append({**t, "behaviour_ref": step_ref.get(tid, ""), "techniques": [tid]})
-    for i, o in enumerate(opps, 1):
-        o["id"] = f"DO-{i}"
-        o["data_sources"] = [o["spec"]["category"]]
+    raw = len(opps)
+    opps = select_opportunities(opps, paths, mitre)
+    if raw != len(opps):
+        ctx.log(f"{raw} candidate opportunities → {len(opps)} after de-duplication and the {MAX_OPPS_PER_STEP}-per-step cap")
     ctx.log(f"{len(opps)} detection opportunities")
     return {"opportunities": opps}, f"{len(opps)} opportunities"
 
@@ -511,19 +567,32 @@ def _vuln_queries(cves: list[str], platforms: list[str], days: int) -> list[dict
     return out
 
 
+def workspace_platforms(db, workspace_ids: list[str]) -> list[str]:
+    """Union of the selected workspaces' configured platforms (their defaults), Sigma always included."""
+    out: list[str] = []
+    for wid in workspace_ids or []:
+        ws = db.get(Workspace, wid)
+        for p in (ws.platforms or []) if ws else []:
+            if p in detection.PLATFORM_IDS and p not in out:
+                out.append(p)
+    return ["sigma"] + [p for p in out if p != "sigma"]
+
+
 def stage_queries(ctx: Ctx):
     cfg = ctx.refresh_config()
-    platforms = [p for p in cfg.get("platforms", ["spl", "kql_defender"]) if p in detection.PLATFORM_IDS]
     days = int(cfg.get("lookback_days", 30))
+    with SessionLocal() as db:
+        platforms = [p for p in (cfg.get("platforms") or workspace_platforms(db, cfg.get("workspace_ids", [])))
+                     if p in detection.PLATFORM_IDS]
     ext = ctx.artifacts["extraction"]["results"]
-    ioc_values: dict[str, set] = {"ipv4": set(), "domain": set(), "sha256": set()}
+    ioc_values: dict[str, dict[str, set]] = {"ipv4": {}, "domain": {}, "sha256": {}}
     vendor_queries = []
     for r in ext.values():
         if not r.get("ok"):
             continue
         for i in r.get("regex_iocs", []) + [{"type": x["type"], "value": x["value"]} for x in r["notes"].get("iocs", [])]:
             if i["type"] in ioc_values:
-                ioc_values[i["type"]].add(refang(i["value"]).lower())
+                ioc_values[i["type"]].setdefault(refang(i["value"]).lower(), set()).add(r["id"])
         for vq in r["notes"].get("vendor_queries", []):
             vendor_queries.append({**vq, "source_id": r["id"]})
 
@@ -543,99 +612,154 @@ def stage_queries(ctx: Ctx):
     with SessionLocal() as db:
         queries = generate_queries(
             db, ctx.artifacts["detection"]["opportunities"], platforms, days,
-            {k: sorted(v) for k, v in ioc_values.items()},
-            [v["cve"] for v in ctx.artifacts["synthesis"]["entities"]["vulnerabilities"]],
+            {k: {v: sort_sids(s) for v, s in sorted(vals.items())} for k, vals in ioc_values.items()},
+            ctx.artifacts["synthesis"]["entities"]["vulnerabilities"],
             [m["technique_id"] for m in ctx.artifacts["attack"]["mitre"]], vendor_queries,
-            llm_fill if _use_llm(ctx) else None, ctx.log)
+            llm_fill if _use_llm(ctx) else None, ctx.log,
+            mitre=ctx.artifacts["attack"]["mitre"], include_generic=bool(cfg.get("include_generic_hunts", False)))
         db.commit()
     lint_fail = sum(1 for q in queries if q["lint"])
-    ctx.log(f"{len(queries)} queries ({sum(1 for q in queries if q['origin'] == 'reference')} vendor reference); {lint_fail} failed lint")
-    return {"queries": queries}, f"{len(queries)} queries"
+    groups = len({q["group"] for q in queries})
+    ctx.log(f"{groups} detections, {len(queries)} query variants on {', '.join(platforms)} "
+            f"({sum(1 for q in queries if q['origin'] == 'reference')} vendor reference); {lint_fail} failed lint")
+    return {"queries": queries}, f"{groups} detections · {len(queries)} queries"
 
 
-def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_values: dict[str, list[str]], cves: list[str],
-                     techniques: list[str], vendor_queries: list[dict], llm_fill=None, logf=lambda m, level="info": None) -> list[dict]:
-    """Sigma first, then per-platform translation, plus IoC, vulnerability, TTP and vendor reference queries."""
+def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_values: dict, cves: list,
+                     techniques: list[str], vendor_queries: list[dict], llm_fill=None, logf=lambda m, level="info": None,
+                     *, mitre: list[dict] | None = None, include_generic: bool = False,
+                     max_generic: int = MAX_GENERIC_HUNTS) -> list[dict]:
+    """Sigma first, then per-platform translation, plus IoC, vulnerability, TTP and vendor reference queries.
+
+    Every query carries `group` (shared by all platform variants of one detection), `source_ids` and `provenance`
+    ("vendor" copied from an article, "derived" from sourced behaviours/IoCs/CVEs, "generic" not threat-specific).
+
+    ioc_values: {type: {value: [source ids]}} (or {type: [values]} with no source trail).
+    cves: [{"cve", "source_ids"}] (or plain CVE strings).
+    Only `platforms` are generated; Sigma is always written for behavioural groups as the neutral source of truth.
+    Generic TTP hunts are opt-in (`include_generic`) and capped at `max_generic` groups.
+    """
+    mitre = mitre or []
+    platforms = [p for p in dict.fromkeys(platforms) if p in detection.PLATFORM_IDS]
+    native = [p for p in platforms if p != "sigma"]
     queries: list[dict] = []
     missing: list[dict] = []
-    if True:
-        def qid() -> str:
-            return next_id(db, "query", "Q")
 
-        def add(type_, title, platform, body, opp=None, techniques=(), fp="", data_sources=(), origin="generated", log_sources=None, sigma_ref=None):
-            issues = detection.lint(platform, body) if origin == "generated" else []
-            queries.append({
-                "id": qid(), "type": type_, "title": title, "platform": platform, "body": body,
-                "opportunity_id": opp, "techniques": list(techniques), "fp_notes": fp, "data_sources": list(data_sources),
-                "log_sources": log_sources if log_sources is not None else [detection.LOG_SOURCES.get(c, {}).get(platform, c) for c in data_sources],
-                "status": "reference" if origin == "reference" else ("syntax_checked" if not issues else "generated"),
-                "lint": issues, "origin": origin, "sigma_ref": sigma_ref,
-            })
+    def qid() -> str:
+        return next_id(db, "query", "Q")
 
-        # IoA / TTP queries from detection opportunities (Sigma first, then per platform)
-        for o in opps:
-            sigma = detection.to_sigma(o["title"], o["spec"], o["id"], o.get("techniques", []), o.get("fp_notes", ""))
-            add(o["type"], o["title"], "sigma", sigma, o["id"], o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"])
-            sig_id = queries[-1]["id"]
-            for p in platforms:
-                if p == "sigma":
-                    continue
-                body = detection.translate(o["spec"], p, days, o["title"])
-                if body is None:
-                    missing.append({"opportunity": o, "platform": p, "sigma": sigma, "sigma_ref": sig_id})
-                    continue
-                add(o["type"], o["title"], p, body, o["id"], o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=sig_id)
+    def add(type_, title, platform, body, group, source_ids, provenance, opp=None, techniques=(), fp="", data_sources=(),
+            origin="generated", log_sources=None, sigma_ref=None):
+        issues = detection.lint(platform, body) if origin == "generated" else []
+        queries.append({
+            "id": qid(), "group": group, "type": type_, "title": title, "platform": platform, "body": body,
+            "opportunity_id": opp, "techniques": list(techniques), "fp_notes": fp, "data_sources": list(data_sources),
+            "log_sources": log_sources if log_sources is not None else [detection.LOG_SOURCES.get(c, {}).get(platform, c) for c in data_sources],
+            "status": "reference" if origin == "reference" else ("syntax_checked" if not issues else "generated"),
+            "lint": issues, "origin": origin, "sigma_ref": sigma_ref,
+            "source_ids": list(source_ids), "provenance": provenance,
+        })
 
-        if missing and llm_fill:
-            by_pair = {(m["opportunity"]["id"], m["platform"]): m for m in missing}
-            for q in llm_fill(missing):
-                m = by_pair.get((q["opportunity_id"], q["platform"]))
-                if m:
-                    o = m["opportunity"]
-                    add(o["type"], o["title"], q["platform"], q["query"], o["id"], o.get("techniques", []), o.get("fp_notes", ""),
-                        o["data_sources"], sigma_ref=m["sigma_ref"])
-        elif missing:
-            gaps = sorted({f"{detection.PLATFORM_BY_ID[m['platform']]['short']} ({detection.CATEGORIES[m['opportunity']['spec']['category']]})" for m in missing})
-            logf(f"No native telemetry for: {', '.join(gaps)}", "warn")
-
-        # IoC retro-hunt queries
-        cat_for = {"ipv4": "network", "domain": "dns", "sha256": "file_hash"}
-        for t, vs in ioc_values.items():
-            vs = sorted(vs)[:200]
-            if not vs:
+    # IoA / TTP queries from detection opportunities (Sigma first, then per platform). One group per opportunity.
+    for o in opps:
+        group = "DET-" + o["id"].split("-", 1)[-1] if o["id"].startswith("DO-") else f"DET-{o['id']}"
+        sids = o.get("source_ids") or mitre_source_ids(mitre, o.get("techniques", []))
+        sigma = detection.to_sigma(o["title"], o["spec"], o["id"], o.get("techniques", []), o.get("fp_notes", ""))
+        add(o["type"], o["title"], "sigma", sigma, group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
+            o["data_sources"])
+        sig_id = queries[-1]["id"]
+        for p in native:
+            body = detection.translate(o["spec"], p, days, o["title"])
+            if body is None:
+                missing.append({"opportunity": o, "platform": p, "sigma": sigma, "sigma_ref": sig_id, "group": group, "source_ids": sids})
                 continue
-            for p in platforms:
-                if p == "sigma":
-                    continue
-                body = detection.ioc_query(p, cat_for[t], vs, days)
-                if body:
-                    add("ioc", f"Retro-hunt: {len(vs)} {t.upper() if t != 'domain' else 'domain'} indicator(s)", p, body,
-                        data_sources=[cat_for[t]])
+            add(o["type"], o["title"], p, body, group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
+                o["data_sources"], sigma_ref=sig_id)
 
-        # Vulnerability exposure queries
-        if cves:
-            for v in _vuln_queries(cves, platforms, days):
-                add("vuln", f"Exposure to {', '.join(cves[:4])}{' +' + str(len(cves) - 4) if len(cves) > 4 else ''}", v["platform"], v["body"],
-                    data_sources=["vuln_mgmt"], log_sources=v["log_sources"])
+    if missing and llm_fill:
+        by_pair = {(m["opportunity"]["id"], m["platform"]): m for m in missing}
+        for q in llm_fill(missing):
+            m = by_pair.pop((q["opportunity_id"], q["platform"]), None)
+            if m:
+                o = m["opportunity"]
+                add(o["type"], o["title"], q["platform"], q["query"], m["group"], m["source_ids"], "derived", o["id"],
+                    o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=m["sigma_ref"])
+    elif missing:
+        gaps = sorted({f"{detection.PLATFORM_BY_ID[m['platform']]['short']} ({detection.CATEGORIES[m['opportunity']['spec']['category']]})" for m in missing})
+        logf(f"No native telemetry for: {', '.join(gaps)}", "warn")
 
-        # Wider TTP hunts (not threat-specific)
-        used = {o["title"] for o in opps}
+    # IoC retro-hunt: one group per indicator type, Sigma plus each platform.
+    cat_for = {"ipv4": "network", "domain": "dns", "sha256": "file_hash"}
+    for t in ("ipv4", "domain", "sha256"):
+        vals = ioc_values.get(t) or {}
+        if not isinstance(vals, dict):
+            vals = {v: [] for v in vals}
+        vs = sorted(vals)[:200]
+        if not vs:
+            continue
+        group = f"IOC-{t.upper()}"
+        sids = sort_sids(s for v in vs for s in vals.get(v, []))
+        title = f"Retro-hunt: {len(vs)} {t.upper() if t != 'domain' else 'domain'} indicator(s)"
+        cat = cat_for[t]
+        field = {"network": "dst_ip", "dns": "domain", "file_hash": "sha256"}[cat]
+        sig_id = None
+        if "sigma" in platforms:
+            spec = {"category": cat, "conditions": [{"field": field, "op": "contains" if cat == "file_hash" else "equals", "values": vs}]}
+            add("ioc", title, "sigma", detection.to_sigma(title, spec, group, [], "Shared or re-assigned infrastructure; check timestamps against the campaign window."),
+                group, sids, "derived", data_sources=[cat])
+            sig_id = queries[-1]["id"]
+        for p in native:
+            body = detection.ioc_query(p, cat, vs, days)
+            if body:
+                add("ioc", title, p, body, group, sids, "derived", data_sources=[cat], sigma_ref=sig_id)
+
+    # Vulnerability exposure: one group for all CVEs.
+    cve_rows = [c if isinstance(c, dict) else {"cve": c, "source_ids": []} for c in cves or []]
+    cve_ids = list(dict.fromkeys(c["cve"] for c in cve_rows if c.get("cve")))
+    if cve_ids:
+        sids = sort_sids(s for c in cve_rows for s in c.get("source_ids", []))
+        title = f"Exposure to {', '.join(cve_ids[:4])}{' +' + str(len(cve_ids) - 4) if len(cve_ids) > 4 else ''}"
+        for v in _vuln_queries(cve_ids, platforms, days):
+            add("vuln", title, v["platform"], v["body"], "VULN-1", sids, "derived", data_sources=["vuln_mgmt"],
+                log_sources=v["log_sources"])
+
+    # Wider TTP hunts (not threat-specific): opt-in, capped, never duplicating an opportunity's logic.
+    if include_generic:
+        used_titles = {o["title"] for o in opps}
+        used_specs = {spec_key(o["spec"]) for o in opps}
+        n = 0
         for tid in dict.fromkeys(techniques):
             for t in TECHNIQUE_OPPORTUNITIES.get(tid, []):
-                if t["type"] != "ttp" or t["title"] in used:
+                if n >= max_generic:
+                    break
+                if t["type"] != "ttp" or t["title"] in used_titles or spec_key(t["spec"]) in used_specs:
                     continue
-                used.add(t["title"])
-                for p in platforms:
-                    if p == "sigma":
-                        continue
+                used_titles.add(t["title"])
+                used_specs.add(spec_key(t["spec"]))
+                n += 1
+                group = f"TTP-{n}"
+                sids = mitre_source_ids(mitre, [tid])
+                sigma = detection.to_sigma(t["title"], t["spec"], group, [tid], t["fp_notes"], level="medium")
+                add("ttp", t["title"], "sigma", sigma, group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]])
+                sig_id = queries[-1]["id"]
+                for p in native:
                     body = detection.translate(t["spec"], p, days, t["title"])
                     if body:
-                        add("ttp", t["title"], p, body, None, [tid], t["fp_notes"], [t["spec"]["category"]])
+                        add("ttp", t["title"], p, body, group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]],
+                            sigma_ref=sig_id)
 
-        # Vendor-supplied reference queries, stored next to generated ones
-        for vq in vendor_queries:
-            plat = vq["platform"] if vq["platform"] in detection.PLATFORM_IDS else "kql_defender" if "kql" in vq["platform"].lower() else vq["platform"]
-            add("ioa", f"{vq['title']} (vendor, {vq.get('source_id', '')})".replace(", )", ")"), plat, vq["query"], origin="reference", log_sources=[])
+    # Vendor-supplied reference queries: each its own group, kept verbatim (deduplicated by body).
+    seen_bodies: set[str] = set()
+    n = 0
+    for vq in vendor_queries:
+        norm = re.sub(r"\s+", " ", vq.get("query", "")).strip().lower()
+        if not norm or norm in seen_bodies:
+            continue
+        seen_bodies.add(norm)
+        n += 1
+        plat = vq["platform"] if vq["platform"] in detection.PLATFORM_IDS else "kql_defender" if "kql" in vq["platform"].lower() else vq["platform"]
+        add("ioa", f"{vq['title']} (vendor, {vq.get('source_id', '')})".replace(", )", ")"), plat, vq["query"], f"VREF-{n}",
+            [vq["source_id"]] if vq.get("source_id") else [], "vendor", origin="reference", log_sources=[])
     return queries
 
 
@@ -720,11 +844,30 @@ def stage_iocs(ctx: Ctx):
 
 # --------------------------------------------------------------------------- 9. Report build
 
+def enrich_vulnerabilities(ctx: Ctx, ent_vulns: list[dict]) -> list[dict]:
+    """Deterministic post-check (spec section 12): look every CVE up in NVD, CISA KEV and EPSS.
+
+    Runs before the report transaction opens (NVD is rate limited). Hunter-edited vulnerabilities are enriched in
+    place of the generated ones. Network failures only log a warning and keep the existing values.
+    """
+    with SessionLocal() as db:
+        prev = db.get(Research, ctx.research_id).record or {}
+    base = prev.get("vulnerabilities", []) if "vulnerabilities" in prev.get("_edited", []) else ent_vulns
+    base = [{"kev_added": None, "epss": None, **v} for v in base]
+    try:
+        out, _ = vulns.enrich(base, logf=ctx.log)
+    except Exception as e:  # noqa: BLE001 - enrichment never fails a run
+        ctx.log(f"CVE enrichment skipped: {e}", "warn")
+        out = base
+    return out
+
+
 def stage_report(ctx: Ctx):
     arts = ctx.artifacts
     syn = arts["synthesis"]
     nar, ent = syn["narrative"], syn["entities"]
     ext = arts["extraction"]["results"]
+    enriched_vulns = enrich_vulnerabilities(ctx, ent["vulnerabilities"])
     with SessionLocal() as db:
         r = db.get(Research, ctx.research_id)
         prev = r.record or {}
@@ -796,14 +939,14 @@ def stage_report(ctx: Ctx):
             "patching_insufficient": nar.get("patching_insufficient", False),
             "recommendations": nar["recommendations"], "results": [], "mitre": arts["attack"]["mitre"],
             "tools_used": tools_used, "workflow": workflow, "hunts": hunts, "industries": nar["industries"],
-            "vulnerabilities": [{**v, "kev_added": None, "epss": None} for v in ent["vulnerabilities"]],
+            "vulnerabilities": enriched_vulns,
             "threat_actors": ent["threat_actors"], "malware_tools": ent["malware_tools"], "attack_paths": attack_paths,
             "ioas": [{**x, "id": f"IOA-{i}"} for i, x in enumerate(ent["ioas"], 1)],
             "iocs": arts.get("iocs", {}).get("iocs", []),
             "detection_opportunities": opps, "log_sources_required": log_sources_required,
             "timeline": nar["timeline"], "sources": sources, "claims": nar["claims"], "conflicts": nar["conflicts"],
             "geography": nar["geography"], "study": nar["study"], "tags": [], "related_research_ids": prev.get("related_research_ids", []),
-            "affected_technologies": sorted({p for v in ent["vulnerabilities"] for p in v.get("affected_products", [])}),
+            "affected_technologies": sorted({p for v in enriched_vulns for p in v.get("affected_products", [])}),
             "run": {"id": ctx.run_id, "mode": ctx.mode, "tokens": run.cost_tokens},
             "review": {k: "generated" for k in ("executive_summary", "impact", "recommendations", "mitre", "hunts", "iocs", "study", "attack_paths")},
             "_edited": sorted(edited),
@@ -813,6 +956,7 @@ def stage_report(ctx: Ctx):
             if k in prev:
                 record[k] = prev[k]
                 record["review"][k] = "edited"
+        record["vulnerabilities"] = enriched_vulns  # already built from the hunter's edits when there are any
 
         applic, gaps = [], []
         for wid in ctx.config.get("workspace_ids", []):
@@ -836,6 +980,8 @@ def stage_report(ctx: Ctx):
         first = not prev
         r.workspace_ids = ctx.config.get("workspace_ids", r.workspace_ids)
         save_record(db, r, record, r.created_by, "Run completed" if first else "Pipeline re-run", bump=not first)
+        db.flush()
+        vulns.update_library(db, record["vulnerabilities"])
         ensure_results(db, r)
         # Mirror results into the record for exports.
         from ..models import Result
@@ -864,6 +1010,9 @@ def stage_export(ctx: Ctx):
     disputed = [c for c in rec.get("conflicts", []) if c.get("status") == "disputed"]
     if disputed:
         issues.append(f"{len(disputed)} disputed claim(s) need a reviewer decision")
+    bad_cves = [v.get("cve") for v in rec.get("vulnerabilities", []) if v.get("validation") in ("not_found", "rejected", "invalid_format")]
+    if bad_cves:
+        issues.append(f"CVE id(s) not found or rejected in NVD: {', '.join(bad_cves)}")
     lint = [q for q in rec.get("hunts", {}).get("queries", []) if q.get("lint")]
     if lint:
         issues.append(f"{len(lint)} quer{'y' if len(lint) == 1 else 'ies'} failed syntax lint")

@@ -6,6 +6,7 @@ import { useState } from "react";
 import { SeenIn } from "@/components/library";
 import { useWsHref } from "@/components/providers";
 import { IocValue } from "@/components/research/ioc-value";
+import { SourceTrail } from "@/components/research/provenance";
 import { Badge, VerdictBadge } from "@/components/ui/badges";
 import { Button } from "@/components/ui/button";
 import { ErrorState, Skeleton, useToast } from "@/components/ui/feedback";
@@ -15,7 +16,7 @@ import { patch, post } from "@/lib/api";
 import { IOC_TYPE_LABEL, VERDICT } from "@/lib/constants";
 import { defang, utc } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
-import type { ResearchStatus, Severity, Verdict } from "@/lib/types";
+import type { ProvenanceItem, ResearchStatus, Severity, Verdict } from "@/lib/types";
 import Link from "next/link";
 
 interface ID {
@@ -23,6 +24,7 @@ interface ID {
   context: { research_id: string; context: string; role: string; sources: string[] }[];
   first_seen: string | null; last_seen: string | null; enriched_at: string | null; expires_at: string | null; research_count: number; source_count: number;
   seen_in: { id: string; title: string; severity: Severity; status: ResearchStatus; created_at: string }[];
+  provenance?: ProvenanceItem[]; provenance_total?: number;
 }
 const PROVIDER: Record<string, string> = { virustotal: "VirusTotal", abuseipdb: "AbuseIPDB", greynoise: "GreyNoise", abusech: "abuse.ch", shodan: "Shodan", otx: "AlienVault OTX", urlscan: "urlscan.io" };
 
@@ -50,7 +52,7 @@ export default function IocDetail() {
           <Panel title="Indicator"><IocValue type={i.type} value={i.value} verdict={i.verdict} sources={i.source_count} /></Panel>
           <Panel title="Reputation by OSINT source" bodyClassName="!p-0">
             {Object.keys(i.reputation ?? {}).length ? (
-              <table className="tl-table tl-compact w-full">
+              <div className="overflow-x-auto"><table className="tl-table tl-compact w-full">
                 <thead><tr><th>Source</th><th>Signal</th><th>Detail</th></tr></thead>
                 <tbody>{Object.entries(i.reputation).map(([k, v]) => (
                   <tr key={k}>
@@ -59,13 +61,13 @@ export default function IocDetail() {
                     <td className="max-w-[360px] truncate font-mono text-mono-sm text-fg-muted">{Object.entries(v).filter(([kk]) => !["summary", "flagged", "error"].includes(kk)).map(([kk, vv]) => `${kk}=${Array.isArray(vv) ? vv.join("|") : vv}`).join(" ")}</td>
                   </tr>
                 ))}</tbody>
-              </table>
+              </table></div>
             ) : <p className="p-4 text-fg-muted">Not enriched yet. Configure keys in <Link className="prose-link" href="/settings/osint">Settings → OSINT API keys</Link>, then re-enrich.</p>}
           </Panel>
           <Panel title="Context">
             <ul className="space-y-3">
               {i.context.map((c, k) => (
-                <li key={k} className="text-[14px]">
+                <li key={k} className="min-w-0 text-[14px] break-words">
                   <Link href={wsHref(`/research/${c.research_id}?tab=iocs`)} className="font-mono text-mono-sm text-accent-text hover:underline">{c.research_id}</Link>
                   {c.role && <Badge className="ml-2">{c.role}</Badge>}
                   {c.context && <p className="mt-1 italic text-fg-strong">“{c.context}”</p>}
@@ -74,9 +76,10 @@ export default function IocDetail() {
               ))}
             </ul>
           </Panel>
+          <SourceTrail items={i.provenance} total={i.provenance_total} wsHref={wsHref} />
           <SeenIn items={i.seen_in} />
         </div>
-        <aside className="space-y-4">
+        <aside className="min-w-0 space-y-4">
           <Panel title="Verdict">
             <Field label="Override verdict" htmlFor="v" help="Benign indicators are hidden from hunt queries by default.">
               <Select id="v" value={i.verdict} onChange={async (v) => { setData(await patch<ID>(`/api/library/iocs/${i.id}`, { verdict: v })); toast({ tone: "success", message: `Verdict set to ${VERDICT[v as Verdict].label}` }); }}

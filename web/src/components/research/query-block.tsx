@@ -5,13 +5,14 @@ import { CircleAlert, Ellipsis, ExternalLink, FileCode, Pencil, BadgeCheck, Tria
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { DATA_SOURCES, QUERY_TYPE } from "@/lib/constants";
-import type { Query, Workspace } from "@/lib/types";
+import type { Provenance, Query, Source, Workspace } from "@/lib/types";
 import { useApp, useWsHref } from "../providers";
 import { AttackChip, Badge, Chip, QueryStatusPill } from "../ui/badges";
 import { Button, CopyButton } from "../ui/button";
 import { Textarea } from "../ui/forms";
 import { PillTabs } from "../ui/layout";
 import { Menu } from "../ui/overlay";
+import { ProvenanceBadge, SourceChips } from "./provenance";
 import { highlight } from "./syntax";
 
 export function applyMappings(body: string, platform: string, ws?: Workspace | null) {
@@ -48,9 +49,11 @@ export function CodeView({ body, platform, maxLines = 18 }: { body: string; plat
 }
 
 /** Query block (design.md 18.3): one detection opportunity, tabs per selected platform. */
-export function QueryBlock({ title, refId, queries, workspace, gaps, onPatch, canEdit = true, defaultPlatform }:
+export function QueryBlock({ title, refId, queries, workspace, gaps, onPatch, canEdit = true, defaultPlatform, provenance, sourceIds, sources, id }:
   { title: string; refId?: string | null; queries: Query[]; workspace?: Workspace | null; gaps?: string[];
-    onPatch?: (qid: string, patch: { status?: string; body?: string }) => Promise<void>; canEdit?: boolean; defaultPlatform?: string }) {
+    onPatch?: (qid: string, patch: { status?: string; body?: string }) => Promise<void>; canEdit?: boolean; defaultPlatform?: string;
+    /** Source trail: shown under the title when given. */
+    provenance?: Provenance; sourceIds?: string[]; sources?: Record<string, Source>; id?: string }) {
   const { platformName } = useApp();
   const wsHref = useWsHref();
   const sorted = useMemo(() => [...queries].sort((a, b) => (a.platform === "sigma" ? 1 : 0) - (b.platform === "sigma" ? 1 : 0)), [queries]);
@@ -66,17 +69,23 @@ export function QueryBlock({ title, refId, queries, workspace, gaps, onPatch, ca
   const sigma = sorted.find((x) => x.platform === "sigma");
 
   return (
-    <section className="overflow-hidden rounded-md border border-line bg-surface" aria-label={title}>
+    <section id={id} className="min-w-0 scroll-mt-32 overflow-hidden rounded-md border border-line bg-surface" aria-label={title}>
       <header className="flex flex-wrap items-start gap-x-3 gap-y-2 border-b border-line px-4 pt-3 pb-2">
         <div className="min-w-0 flex-1">
-          <h4 className="text-h4 font-semibold">
+          <h4 className="text-h4 font-semibold break-words [overflow-wrap:anywhere]">
             {refId && <span className="font-mono text-mono-sm text-fg-muted">{refId} · </span>}{title}
           </h4>
+          {(provenance || sources) && (
+            <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              {provenance && <ProvenanceBadge provenance={provenance} />}
+              {sources && <SourceChips ids={sourceIds ?? []} sources={sources} empty={provenance === "generic" ? "Not tied to a specific source" : "No source recorded"} />}
+            </div>
+          )}
         </div>
         <Badge>{QUERY_TYPE[q.type] ?? q.type}</Badge>
         <QueryStatusPill status={q.status} />
       </header>
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2 px-4 py-2">
         <PillTabs ariaLabel="Platform" value={q.id} onChange={(id) => { setPid(id); setEditing(false); }}
           tabs={sorted.map((x) => ({ id: x.id, label: platformName(x.platform, true) }))} />
         <div className="flex items-center gap-1">

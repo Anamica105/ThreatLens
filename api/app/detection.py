@@ -383,19 +383,157 @@ def ioc_query(platform: str, category: str, values: list[str], days: int = 30) -
     return translate({"category": category, "conditions": [{"field": field, "op": op, "values": values}]}, platform, days, "ioc_retrohunt")
 
 
-def apply_mappings(body: str, platform: str, mappings: dict) -> str:
-    """Workspace field mappings: {platform: {"from": "to", ...}} e.g. {"spl": {"index=endpoint": "index=acme_edr"}}."""
-    for src, dst in (mappings or {}).get(platform, {}).items():
-        body = body.replace(src, dst)
+# ---- query status lifecycle (spec 8.5) ----
+# Generated -> Syntax-checked -> Reviewed -> Lab-tested (P2) -> Deployed. Vendor-supplied queries start as "reference";
+# "deprecated" retires a query (kept as history in the library).
+QUERY_STATUS_FLOW = ["generated", "syntax_checked", "reviewed", "lab_tested", "deployed"]
+QUERY_STATUSES = QUERY_STATUS_FLOW + ["reference", "deprecated"]
+QUERY_STATUS_LABELS = {"generated": "Generated", "syntax_checked": "Syntax-checked", "reviewed": "Reviewed",
+                       "lab_tested": "Lab-tested", "deployed": "Deployed", "reference": "Reference", "deprecated": "Deprecated"}
+_STATUS_RANK = {"reference": 0, **{s: i for i, s in enumerate(QUERY_STATUS_FLOW)}, "deprecated": len(QUERY_STATUS_FLOW)}
+
+
+def status_rank(status: str | None) -> int:
+    return _STATUS_RANK.get(status or "", -1)
+
+
+def more_advanced_status(a: str | None, b: str | None) -> str | None:
+    """The later of two lifecycle statuses (deprecated counts as the end of the lifecycle)."""
+    return a if status_rank(a) >= status_rank(b) else b
+
+
+def check_status_change(new: str, *, origin: str = "generated", lint_issues: list[str] | None = None) -> str | None:
+    """Why a query cannot be moved to `new` (None = allowed). Moving backwards (demoting) is allowed."""
+    if new not in QUERY_STATUSES:
+        return f"Unknown query status '{new}'. Use one of: {', '.join(QUERY_STATUSES)}."
+    if new == "reference" and origin != "reference":
+        return "Only vendor-supplied queries can have status 'reference'."
+    if origin == "reference" and new in ("generated", "syntax_checked"):
+        return "Vendor reference queries are not linted; use reference, reviewed, lab_tested, deployed or deprecated."
+    if origin != "reference" and lint_issues and new in ("syntax_checked", "reviewed", "lab_tested", "deployed"):
+        return f"Fix the lint findings before marking the query {QUERY_STATUS_LABELS[new]}: " + "; ".join(lint_issues)
+    return None
+
+
+# ---- workspace field mappings (spec 8.4) ----
+#
+# Workspace.field_mappings = {platform: {from: to}} (a "*" platform key applies to every platform). Entries are matched
+# as tokens, not raw substrings:
+#   * `key=value` (index=endpoint, sourcetype="XmlWinEventLog:...", #event_simpleName=ProcessRollup2): matches that
+#     assignment, with or without quotes and spaces around '=', and only as a whole value (index=endpoint never hits
+#     index=endpoint_old). The replacement is inserted as written.
+#   * a bare identifier (table name, field name, dotted ECS/UDM path, index pattern such as logs-endpoint.events.process-*):
+#     replaced as a whole token outside string literals, so a field rename never rewrites a searched value.
+#   * a quoted identifier ("Process CommandLine" in AQL) is replaced literally.
+#   * anything else falls back to a literal replace.
+
+_IDENT = r"[A-Za-z_@#$][\w.@$:*-]*"
+_ASSIGN_RE = re.compile(r"""^\s*(#?[A-Za-z_][\w.]*)\s*=\s*(["']?)(.+?)\2\s*$""")
+_IDENT_RE = re.compile(rf"^{_IDENT}$")
+_LITERAL_RE = re.compile(r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`]*`""")
+_CQL_REGEX_RE = re.compile(r"(?<==)/(?:\\.|[^/\n])+/[a-z]*")
+
+
+def _literal_spans(body: str, platform: str) -> list[tuple[int, int]]:
+    """Spans of string literals (and CQL regex literals), which identifier mappings must not touch."""
+    spans = [m.span() for m in _LITERAL_RE.finditer(body)]
+    if platform == "cql":
+        spans += [m.span() for m in _CQL_REGEX_RE.finditer(body)]
+    return spans
+
+
+def _outside(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    return not any(a < end and start < b for a, b in spans)
+
+
+def _map_one(body: str, platform: str, src: str, dst: str) -> str:
+    m = _ASSIGN_RE.match(src)
+    if m:
+        key, val = m.group(1), m.group(3)
+        rx = re.compile(rf"""(?<![\w.#]){re.escape(key)}\s*=\s*(["']?){re.escape(val)}\1(?![\w.*:/-])""", re.I)
+        spans = _literal_spans(body, platform)
+        return rx.sub(lambda hit: dst if _outside(spans, hit.start(), hit.start() + 1) else hit.group(0), body)
+    s = src.strip()
+    if _IDENT_RE.match(s):
+        rx = re.compile(rf"(?<![\w.@#$]){re.escape(s)}(?![\w*-])(?!\.\w)")
+        spans = _literal_spans(body, platform)
+        out, last = [], 0
+        for hit in rx.finditer(body):
+            if _outside(spans, *hit.span()):
+                out += [body[last:hit.start()], dst]
+                last = hit.end()
+        return "".join(out) + body[last:]
+    return body.replace(src, dst)
+
+
+def workspace_mappings(mappings: dict | None, platform: str) -> dict[str, str]:
+    m = mappings or {}
+    return {**(m.get("*") or {}), **(m.get(platform) or {})}
+
+
+def apply_mappings(body: str, platform: str, mappings: dict | None) -> str:
+    """Apply a workspace's field mappings ({platform: {from: to}}) to one query body, token-aware (see above).
+    Longer `from` keys are applied first so `index=endpoint_raw` wins over `index=endpoint`."""
+    for src, dst in sorted(workspace_mappings(mappings, platform).items(), key=lambda kv: -len(kv[0])):
+        if src and src.strip() and dst is not None:
+            body = _map_one(body, platform, src, str(dst))
     return body
 
 
-def lint(platform: str, body: str) -> list[str]:
-    """Cheap syntax checks per platform. Returns a list of problems (empty = passed)."""
+def map_query(q: dict, mappings: dict | None) -> dict:
+    """{mapped_body, mapped_lint, mapping_applied} for a record query under a workspace's mappings. Lint re-runs on the
+    mapped text (vendor reference queries are never linted)."""
+    body = q.get("body", "")
+    mapped = apply_mappings(body, q.get("platform", ""), mappings)
+    issues = [] if q.get("origin") == "reference" else lint(q.get("platform", ""), mapped, q.get("techniques"))
+    return {"mapped_body": mapped, "mapped_lint": issues, "mapping_applied": mapped != body}
+
+
+_TECH_ID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
+_SIGMA_ATTACK_TAG_RE = re.compile(r"^\s*-\s*['\"]?attack\.([A-Za-z0-9_.-]+)['\"]?\s*$", re.M)
+
+
+def attack_lint(techniques=None, body: str = "", platform: str = "") -> list[str]:
+    """ATT&CK tag check (spec 8.5): the query's `techniques` and, for Sigma, its `attack.*` tags must exist in the
+    ATT&CK catalog (app.attack, bundled or synced). Sigma tactic tags (attack.execution, attack.initial_access) must name
+    a real tactic; group/software tags (attack.g0016, attack.s0002) are accepted as-is."""
+    from . import attack
+
+    issues: list[str] = []
+    seen: set[str] = set()
+
+    def check(tid: str, where: str):
+        t = tid.strip().upper()
+        if t in seen:
+            return
+        seen.add(t)
+        if not _TECH_ID_RE.match(t):
+            issues.append(f"Malformed ATT&CK technique id '{tid}'{where}")
+        elif not attack.valid_technique(t):
+            issues.append(f"Unknown ATT&CK technique {t}{where} (not in the ATT&CK catalog)")
+
+    for tid in techniques or []:
+        check(str(tid), "")
+    if platform == "sigma" and body:
+        tactics = {t["shortname"].replace("-", "_") for t in attack.TACTICS}
+        for tag in _SIGMA_ATTACK_TAG_RE.findall(body):
+            low = tag.lower()
+            if re.match(r"^t\d", low):
+                check(tag, " in Sigma tags")
+            elif re.match(r"^[gs]\d{4}$", low):
+                continue
+            elif low.replace("-", "_") not in tactics:
+                issues.append(f"Unknown ATT&CK tactic tag 'attack.{tag}' in Sigma tags")
+    return issues
+
+
+def lint(platform: str, body: str, techniques=None) -> list[str]:
+    """Cheap syntax checks per platform plus the ATT&CK tag check. Returns a list of problems (empty = passed)."""
     issues: list[str] = []
     b = body.strip()
     if not b:
         return ["Query is empty"]
+    issues += attack_lint(techniques, b, platform)
     stripped = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`[^`]*`|/(?:\\.|[^/\n])+/[a-z]*', "", b)
     for o, c in ("()", "[]", "{}"):
         if stripped.count(o) != stripped.count(c):

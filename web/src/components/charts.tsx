@@ -120,7 +120,7 @@ export function AttackHeatmap({ tactics, onCell }: {
   const table = { head: ["Tactic", "Technique", "Research"], rows: tactics.flatMap((t) => t.techniques.map((c) => [t.name, `${c.id} ${c.name}`, c.count])) };
   return (
     <ChartFrame height={shown * 30 + 40} table={table}>
-      <div className="overflow-x-auto">
+      <div className="fade-x -mx-1 overflow-x-auto px-1 pb-1">
         <div className="grid min-w-[900px] gap-1" style={{ gridTemplateColumns: `repeat(${tactics.length}, minmax(0,1fr))` }}>
           {tactics.map((t) => (
             <div key={t.id} className="min-w-0">

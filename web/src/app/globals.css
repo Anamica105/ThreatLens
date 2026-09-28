@@ -51,6 +51,8 @@
   --elev-1:0 1px 0 var(--border-subtle);
   --elev-2:0 8px 24px rgba(24,28,35,.14);
   --elev-3:0 16px 48px rgba(24,28,35,.22);
+  /* Level-3 elevation cast sideways, for the navigation rail when it overlays content. */
+  --elev-rail:12px 0 32px rgba(24,28,35,.16), 1px 0 0 var(--border-subtle);
   --scrim:rgba(24,28,35,.48);
   --ease-standard:cubic-bezier(0.2,0,0,1); --ease-exit:cubic-bezier(0.3,0,1,1);
   --motion-instant:80ms; --motion-fast:120ms; --motion-base:200ms; --motion-slow:280ms;
@@ -87,6 +89,7 @@
 
   --elev-2:0 8px 24px rgba(0,0,0,.28), inset 0 1px 0 #FFFFFF14;
   --elev-3:0 16px 48px rgba(0,0,0,.44), inset 0 1px 0 #FFFFFF14;
+  --elev-rail:12px 0 32px rgba(0,0,0,.5), inset -1px 0 0 #FFFFFF0F;
   --scrim:rgba(0,0,0,.6);
   color-scheme: dark;
 }
@@ -146,7 +149,7 @@
 
   --radius-xs: 2px; --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px;
   --container-form: 760px; --container-reading: 72ch; --container-content: 1440px;
-  --shadow-elev-1: var(--elev-1); --shadow-elev-2: var(--elev-2); --shadow-elev-3: var(--elev-3);
+  --shadow-elev-1: var(--elev-1); --shadow-elev-2: var(--elev-2); --shadow-elev-3: var(--elev-3); --shadow-elev-rail: var(--elev-rail);
 }
 
 html, body { background: var(--bg-app); color: var(--text-primary); }

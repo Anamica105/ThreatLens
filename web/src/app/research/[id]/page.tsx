@@ -13,6 +13,8 @@ import { ListTab } from "@/components/research/detail/list-tab";
 import { ReportTab } from "@/components/research/detail/report-tab";
 import { StudyTab } from "@/components/research/detail/study-tab";
 import { TreeTab } from "@/components/research/detail/tree-tab";
+import { PathTab } from "@/components/research/detail/path-tab";
+import { groupQueries } from "@/components/research/provenance";
 import { Chip, ConfidenceBadge, ResultPill, SeverityBadge, StatusPill, TlpBadge } from "@/components/ui/badges";
 import { Button, ButtonGroup, ButtonLink } from "@/components/ui/button";
 import { Banner, EmptyState, ErrorState, Skeleton, useToast } from "@/components/ui/feedback";
@@ -25,7 +27,7 @@ import { copyText, useApi, useLocalStorage } from "@/lib/hooks";
 import type { ResearchDetail } from "@/lib/types";
 import { FileX } from "lucide-react";
 
-const TABS = ["report", "tree", "list", "study", "hunts", "iocs", "sources", "activity"] as const;
+const TABS = ["report", "path", "tree", "list", "study", "hunts", "iocs", "sources", "activity"] as const;
 type Tab = (typeof TABS)[number];
 
 const EXPORTS = [
@@ -77,7 +79,7 @@ export default function ResearchDetailPage() {
       const t = e.target as HTMLElement;
       if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable || e.ctrlKey || e.metaKey || e.altKey) return;
       const n = Number(e.key);
-      if (n >= 1 && n <= 8) setTab(TABS[n - 1]);
+      if (n >= 1 && n <= TABS.length) setTab(TABS[n - 1]);
       if (e.key === "c") {
         const el = document.activeElement?.closest("[data-copy]") as HTMLElement | null;
         if (el?.dataset.copy) { copyText(el.dataset.copy); toast({ tone: "success", message: "Copied" }); }
@@ -122,7 +124,7 @@ export default function ResearchDetailPage() {
   const isReviewer = !!user && ["reviewer", "lead", "admin"].includes(user.role);
   const sev = SEVERITY[d.severity] ?? SEVERITY.medium;
   const curResult = ws !== "all" ? d.results.find((r) => r.workspace_id === ws) : null;
-  const counts = { hunts: rec.hunts?.queries?.length ?? 0, iocs: rec.iocs.length, sources: rec.sources.length };
+  const counts = { hunts: rec.hunts?.queries?.length ? groupQueries(rec).length : 0, iocs: rec.iocs.length, sources: rec.sources.length };
 
   const doExport = async (fmt: string, opts?: { hide?: string[]; study?: boolean }) => {
     if (fmt === "email") { setEmailOpen(true); setLastExport("email"); return; }
@@ -154,7 +156,7 @@ export default function ResearchDetailPage() {
     : d.status === "archived" ? { label: "Restore", icon: <Undo2 />, run: () => status("restore") } : null;
 
   const tabs = [
-    { id: "report", label: "Report" }, { id: "tree", label: "Tree" }, { id: "list", label: "List" }, { id: "study", label: "Study" },
+    { id: "report", label: "Report" }, { id: "path", label: "Research path" }, { id: "tree", label: "Tree" }, { id: "list", label: "List" }, { id: "study", label: "Study" },
     { id: "hunts", label: "Hunts", count: counts.hunts }, { id: "iocs", label: "IoCs", count: counts.iocs }, { id: "sources", label: "Sources", count: counts.sources },
     { id: "activity", label: "Activity" },
   ];
@@ -170,7 +172,7 @@ export default function ResearchDetailPage() {
           <span className="w-1 shrink-0" style={{ background: sev.solid }} aria-hidden />
           <span className="sr-only">Severity: {sev.label}</span>
           <div className="min-w-0 flex-1 space-y-4 p-5">
-            <h1 className="text-display font-bold tracking-[-0.005em]">{rec.title}</h1>
+            <h1 className="text-display font-bold tracking-[-0.005em] break-words [overflow-wrap:anywhere]">{rec.title}</h1>
             <div className="flex flex-wrap items-center gap-2">
               <StatusPill status={d.status} />
               <SeverityBadge severity={d.severity} />
@@ -228,6 +230,7 @@ export default function ResearchDetailPage() {
         </div>
         <div id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`} className="pt-6">
           {tab === "report" && <ReportTab {...props} tacticFilter={tacticFilter} />}
+          {tab === "path" && <PathTab {...props} />}
           {tab === "tree" && <TreeTab {...props} />}
           {tab === "list" && <ListTab {...props} tacticFilter={tacticFilter} />}
           {tab === "study" && <StudyTab {...props} />}

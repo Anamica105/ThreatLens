@@ -17,11 +17,12 @@ import { Dialog } from "../../ui/overlay";
 import { patch, post, put } from "@/lib/api";
 import { ClaimConflict } from "../claim-conflict";
 import { IocValue } from "../ioc-value";
+import { groupAnchor, groupQueries } from "../provenance";
 import { SectionHeading, SourceRefs, type DetailProps, Quote } from "./common";
 
 const TOC = [
   ["executive-summary", "Executive summary"], ["impact", "Impact"], ["recommendations", "Recommendations"], ["result", "Result"],
-  ["vulnerabilities", "Vulnerabilities"], ["actors", "Threat actors"], ["attack-paths", "Attack paths"], ["mitre", "MITRE ATT&CK"],
+  ["vulnerabilities", "Vulnerabilities"], ["actors", "Threat actors"], ["attack-paths", "Attack paths"], ["mitre", "MITRE ATT&CK"], ["opportunities", "Detection opportunities"],
   ["ioas", "Indicators of attack"], ["tools", "Tools used"], ["workflow", "Workflow"], ["hunts", "Hunts"], ["iocs", "IoCs"],
   ["industries", "Industries"], ["timeline", "Timeline"],
 ] as const;
@@ -64,7 +65,9 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
   ) : null;
 
   const mitre = tacticFilter ? rec.mitre.filter((m) => m.tactic_id === tacticFilter) : rec.mitre;
-  const queries = rec.hunts?.queries?.filter((q) => q.origin !== "reference") ?? [];
+  const detections = useMemo(() => groupQueries(rec), [rec]);
+  const steps = useMemo(() => rec.attack_paths.flatMap((p) => p.steps), [rec.attack_paths]);
+  const nDet = (t: string) => detections.filter((g) => g.type === t).length;
   const wsGaps = (rec.coverage_gaps ?? []).filter((g) => ws === "all" || g.workspace_id === ws);
 
   return (
@@ -184,8 +187,8 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
             <div className="grid gap-3 md:grid-cols-2">
               {rec.threat_actors.map((a) => (
                 <div key={a.name} className="rounded-md border border-line bg-surface p-4">
-                  <div className="flex items-center gap-2">
-                    <Link href={wsHref(`/library/actors/${a.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`)} className="text-h4 font-semibold hover:underline">{a.name}</Link>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Link href={wsHref(`/library/actors/${a.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`)} className="min-w-0 text-h4 font-semibold break-words hover:underline">{a.name}</Link>
                     <ConfidenceBadge level={a.attribution_confidence} />
                   </div>
                   {a.aliases.length > 0 && <p className="mt-1 text-body-sm text-fg-muted">Also known as {a.aliases.join(", ")}</p>}
@@ -202,12 +205,12 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
             <div className="space-y-4">
               {rec.attack_paths.map((p) => (
                 <div key={p.id} className="rounded-md border border-line bg-surface p-4">
-                  <h3 className="text-h4 font-semibold"><span className="font-mono text-mono-sm text-fg-muted">{p.id}</span> · {p.name}</h3>
+                  <h3 className="text-h4 font-semibold break-words"><span className="font-mono text-mono-sm text-fg-muted">{p.id}</span> · {p.name}</h3>
                   <ol className="mt-3 space-y-2">
                     {p.steps.map((s) => (
                       <li key={s.ref} className="flex items-start gap-3">
                         <span className="mt-0.5 w-12 shrink-0 font-mono text-mono-sm text-fg-muted">{s.ref}</span>
-                        <span className="flex-1 text-[14px]">{s.behaviour}<SourceRefs ids={s.source_ids} sources={sources} /></span>
+                        <span className="min-w-0 flex-1 text-[14px] break-words [overflow-wrap:anywhere]">{s.behaviour}<SourceRefs ids={s.source_ids} sources={sources} /></span>
                         <AttackChip id={s.technique_id} />
                       </li>
                     ))}
@@ -225,6 +228,30 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
           </>}>MITRE ATT&amp;CK</SectionHeading>
           <MitreTable rows={mitre} sources={sources} canEdit={canEdit} onRemove={(tid) => patchRecord({ mitre: rec.mitre.filter((m) => m.technique_id !== tid) }, `Removed ${tid}`)} />
         </section>
+
+        {rec.detection_opportunities.length > 0 && (
+          <section>
+            <SectionHeading id="opportunities" actions={<Link href="?tab=path" className="text-[14px] font-semibold text-accent-text hover:underline">Trace in Research path</Link>}>Detection opportunities</SectionHeading>
+            <ul className="space-y-2">
+              {rec.detection_opportunities.map((o) => {
+                const step = steps.find((s) => s.ref === o.behaviour_ref);
+                const g = detections.find((x) => x.opportunityId === o.id);
+                return (
+                  <li key={o.id} className="min-w-0 rounded-md border border-line bg-surface px-4 py-3">
+                    <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                      <span className="font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{o.id}</span>
+                      <span className="min-w-0 text-h4 font-semibold break-words">{o.title}</span>
+                      <SourceRefs ids={o.source_ids?.length ? o.source_ids : step?.source_ids ?? []} sources={sources} />
+                      {g && <Link href={`?tab=hunts#${groupAnchor(g.key)}`} className="ml-auto text-body-sm font-semibold text-accent-text hover:underline">{g.queries.length} queries</Link>}
+                    </div>
+                    <p className="mt-1 text-[14px] break-words">{o.logic}</p>
+                    {step && <p className="mt-1 text-caption text-fg-muted break-words">From {step.ref}: {step.behaviour}</p>}
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
 
         {rec.ioas?.length > 0 && (
           <section>
@@ -286,8 +313,8 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         <section>
           <SectionHeading id="hunts" actions={<Link href="?tab=hunts" className="text-[14px] font-semibold text-accent-text hover:underline">Open Hunts tab</Link>}>Hunts</SectionHeading>
           <p className="reading text-body-lg">
-            {queries.filter((q) => q.type === "ioa").length} IoA, {queries.filter((q) => q.type === "ioc").length} IoC, {queries.filter((q) => q.type === "vuln").length} vulnerability
-            and {queries.filter((q) => q.type === "ttp").length} TTP queries across {rec.hunts.platforms.length} platform{rec.hunts.platforms.length === 1 ? "" : "s"}, with a {rec.hunts.lookback_days}-day look-back.
+            {detections.length} detection{detections.length === 1 ? "" : "s"} ({nDet("ioa")} IoA, {nDet("ioc")} IoC, {nDet("vuln")} vulnerability and {nDet("ttp")} TTP)
+            as {rec.hunts?.queries?.length ?? 0} platform variants across {rec.hunts.platforms.length} platform{rec.hunts.platforms.length === 1 ? "" : "s"}, with a {rec.hunts.lookback_days}-day look-back.
           </p>
           {wsGaps.length > 0 && (
             <div className="mt-3 rounded-md border px-4 py-3" style={{ background: "var(--warning-soft)", borderColor: "var(--warning-border)" }}>
@@ -313,7 +340,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter }:
         <section>
           <SectionHeading id="industries">Industries</SectionHeading>
           <div className="flex flex-wrap gap-2">
-            {rec.industries.map((i) => <Chip key={i.industry} title={`${i.evidence} · ${i.source_ids.join(", ")}`}>{i.industry} <span className="text-fg-muted">· {i.evidence}</span></Chip>)}
+            {rec.industries.map((i) => <span key={i.industry} className="inline-flex max-w-full items-center"><Chip title={`${i.evidence} · ${i.source_ids.join(", ")}`}>{i.industry} <span className="text-fg-muted">· {i.evidence}</span></Chip><SourceRefs ids={i.source_ids} sources={sources} /></span>)}
             {!rec.industries.length && <p className="text-fg-muted">No targeted industries identified.</p>}
           </div>
           {rec.geography?.length > 0 && <p className="mt-3 text-[14px]"><span className="text-fg-muted">Regions: </span>{rec.geography.join(", ")}</p>}

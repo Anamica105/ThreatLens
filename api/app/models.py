@@ -230,6 +230,28 @@ class ExportLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ExternalCache(Base):
+    """Cached responses from public reference feeds (NVD, CISA KEV, FIRST EPSS), keyed e.g. `nvd:CVE-2025-53770`."""
+
+    __tablename__ = "external_cache"
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AuditEvent(Base):
+    """Audit log of views (spec section 13). Edits and exports live in activity_event / export_log."""
+
+    __tablename__ = "audit_event"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(String(20), default="view")
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    entity_type: Mapped[str] = mapped_column(String(20), index=True)  # research, actor, malware, query, ioc, cve
+    entity_id: Mapped[str] = mapped_column(String(600), index=True)
+    path: Mapped[str] = mapped_column(String(600), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class Setting(Base):
     __tablename__ = "setting"
     key: Mapped[str] = mapped_column(String(80), primary_key=True)

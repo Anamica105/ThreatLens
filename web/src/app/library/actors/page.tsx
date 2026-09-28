@@ -1,12 +1,13 @@
 "use client";
 
-import { UserRoundSearch } from "lucide-react";
+import { SearchX, UserRoundSearch } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
-import { CardLink, LibraryLayout, RailGroup } from "@/components/library";
+import { CardFooter, CardGrid, CardHeader, CardLink, LibraryEmpty, LibraryLayout, TableShell, facetOptions, single } from "@/components/library";
 import { useWsHref } from "@/components/providers";
 import { AttackChip, Chip } from "@/components/ui/badges";
-import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/feedback";
+import { Button } from "@/components/ui/button";
+import { ErrorState, SkeletonRows } from "@/components/ui/feedback";
 import { Page, PageHeader } from "@/components/ui/layout";
 import { qs } from "@/lib/api";
 import { relative, utc } from "@/lib/format";
@@ -29,50 +30,56 @@ export default function ActorsLibrary() {
   const { data, error, reload } = useApi<{ items: ActorRow[]; facets: { origin: string[]; motivation: string[]; industry: string[] } }>(
     `/api/library/actors${qs({ q: dq, origin, motivation, industry, sort })}`);
   const facets = data?.facets;
+  const filtered = !!(dq || origin || motivation || industry);
+  const clear = () => { setQ(""); setOrigin(""); setMotivation(""); setIndustry(""); };
   return (
     <Page>
       <PageHeader crumbs={[{ label: "Libraries" }, { label: "Threat actors" }]} title="Threat actors" description="Built automatically from research runs; profiles are editable." />
-      <LibraryLayout search={q} onSearch={setQ} searchLabel="Search actors and aliases" sort={sort} onSort={setSort} view={view} onView={setView}
+      <LibraryLayout storageKey="actors" search={q} onSearch={setQ} searchLabel="Search actors and aliases" sort={sort} onSort={setSort} view={view} onView={setView}
         sortOptions={[{ value: "last_seen", label: "Last seen" }, { value: "research", label: "Most research" }, { value: "name", label: "Name" }]}
-        activeFilters={[origin, motivation, industry].filter(Boolean).length}
-        filters={<>
-          <RailGroup label="Origin" options={facets?.origin ?? []} value={origin} onChange={setOrigin} />
-          <RailGroup label="Motivation" options={facets?.motivation ?? []} value={motivation} onChange={setMotivation} />
-          <RailGroup label="Industries" options={facets?.industry ?? []} value={industry} onChange={setIndustry} />
-        </>}>
+        total={data?.items.length} noun={["actor", "actors"]} onClearAll={clear}
+        filters={[
+          { key: "origin", label: "Origin", options: facetOptions(facets?.origin), ...single(origin, setOrigin) },
+          { key: "motivation", label: "Motivation", options: facetOptions(facets?.motivation), ...single(motivation, setMotivation) },
+          { key: "industry", label: "Industry", options: facetOptions(facets?.industry), ...single(industry, setIndustry) },
+        ]}>
         {error ? <ErrorState error={error} onRetry={reload} /> : !data ? <SkeletonRows /> : !data.items.length ? (
-          <EmptyState icon={<UserRoundSearch />} title="No threat actors yet" body="Actors are added when a research run attributes activity." />
+          filtered ? <LibraryEmpty icon={<SearchX />} title="No actors match these filters" body="Try another search term or remove a filter." action={<Button onClick={clear}>Clear filters</Button>} />
+            : <LibraryEmpty icon={<UserRoundSearch />} title="No threat actors yet" body="Actors are added when a research run attributes activity." />
         ) : view === "cards" ? (
-          <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-3">
+          <CardGrid>
             {data.items.map((a) => (
-              <CardLink key={a.id} href={wsHref(`/library/actors/${a.id}`)}>
-                <div className="flex items-start justify-between gap-2">
-                  <h3 className="text-h3 font-semibold">{a.name}</h3>
-                  {a.origin && <Chip>{a.origin}</Chip>}
-                </div>
-                <p className="truncate text-body-sm text-fg-muted">{a.aliases.length ? a.aliases.join(", ") : "No known aliases"}</p>
-                <div className="flex flex-wrap gap-1.5">{a.motivation.map((m) => <Chip key={m}>{m}</Chip>)}</div>
-                <div className="relative z-[1] flex flex-wrap gap-1.5">{a.top_techniques.map((t) => <AttackChip key={t.id} id={t.id} name={t.name.split(": ").pop()} />)}</div>
-                <div className="mt-auto border-t border-line pt-3 text-caption text-fg-muted">
-                  Seen in {a.research_count} research · last seen <span title={utc(a.last_seen)}>{relative(a.last_seen)}</span>
-                </div>
+              <CardLink key={a.id} href={wsHref(`/library/actors/${a.id}`)} label={a.name}>
+                <CardHeader title={a.name} icon={<UserRoundSearch />} sub={a.aliases.length ? a.aliases.join(", ") : "No known aliases"}
+                  aside={a.origin ? <Chip>{a.origin}</Chip> : undefined} />
+                {a.motivation.length > 0 && <div className="flex min-w-0 flex-wrap gap-1.5">{a.motivation.map((m) => <Chip key={m}>{m}</Chip>)}</div>}
+                {a.top_techniques.length > 0 && (
+                  <div className="relative z-[1] flex min-w-0 flex-col items-start gap-1.5">
+                    {a.top_techniques.map((t) => <AttackChip key={t.id} id={t.id} name={t.name.split(": ").pop()} />)}
+                  </div>
+                )}
+                <CardFooter>
+                  <span className="truncate">Seen in {a.research_count} research</span>
+                  <span className="ml-auto shrink-0" title={utc(a.last_seen)}>Last seen {relative(a.last_seen)}</span>
+                </CardFooter>
               </CardLink>
             ))}
-          </div>
+          </CardGrid>
         ) : (
-          <div className="overflow-x-auto rounded-md border border-line bg-surface">
+          <TableShell>
             <table className="tl-table tl-comfortable w-full">
               <thead><tr><th>Name</th><th>Aliases</th><th>Origin</th><th>Motivation</th><th className="num">Research</th><th>Last seen</th></tr></thead>
               <tbody>{data.items.map((a) => (
                 <tr key={a.id}>
-                  <td><Link href={wsHref(`/library/actors/${a.id}`)} className="font-semibold hover:underline">{a.name}</Link></td>
-                  <td className="max-w-[260px] truncate text-fg-muted">{a.aliases.join(", ") || "—"}</td>
-                  <td>{a.origin || "—"}</td><td>{a.motivation.join(", ") || "—"}</td>
-                  <td className="num">{a.research_count}</td><td title={utc(a.last_seen)}>{relative(a.last_seen)}</td>
+                  <td className="whitespace-nowrap"><Link href={wsHref(`/library/actors/${a.id}`)} className="font-semibold hover:underline">{a.name}</Link></td>
+                  <td className="max-w-[260px] truncate text-fg-muted" title={a.aliases.join(", ")}>{a.aliases.join(", ") || "—"}</td>
+                  <td className="whitespace-nowrap">{a.origin || "—"}</td>
+                  <td className="max-w-[220px] truncate" title={a.motivation.join(", ")}>{a.motivation.join(", ") || "—"}</td>
+                  <td className="num">{a.research_count}</td><td className="whitespace-nowrap" title={utc(a.last_seen)}>{relative(a.last_seen)}</td>
                 </tr>
               ))}</tbody>
             </table>
-          </div>
+          </TableShell>
         )}
       </LibraryLayout>
     </Page>

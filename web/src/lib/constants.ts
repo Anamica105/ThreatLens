@@ -93,3 +93,28 @@ export const RELIABILITY: Record<string, string> = {
 export const CREDIBILITY: Record<number, string> = {
   1: "Confirmed", 2: "Probably true", 3: "Possibly true", 4: "Doubtfully true", 5: "Improbable", 6: "Truth cannot be judged",
 };
+
+/** Where a detection came from (backend `provenance`; inferred when absent). */
+export const PROVENANCE: Record<string, { label: string; short: string; tone: Tone; help: string }> = {
+  vendor: { label: "Vendor-supplied", short: "Vendor", tone: "info", help: "Published by a source and stored verbatim." },
+  derived: { label: "Derived from sources", short: "Derived", tone: "accent", help: "Written by ThreatLens from behaviour and indicators the sources describe." },
+  generic: { label: "Generic hunt", short: "Generic", tone: "neutral", help: "Hunts the wider technique; not tied to a specific source." },
+};
+
+/** How source discovery found an article. */
+export const SOURCE_ORIGIN: Record<string, string> = {
+  vendor_feed: "Vendor feed", web_search: "Open web", open_web: "Open web", seed: "Seed URL", seed_url: "Seed URL", seed_text: "Seed text", manual: "Added by hand",
+};
+
+/** Query lifecycle order; the lowest variant status summarises a detection group. */
+export const QUERY_STATUS_ORDER = ["generated", "syntax_checked", "reviewed", "lab_tested", "deployed", "reference", "deprecated"];
+
+/** The six stages of the research path (spec §2): subject → classification → web search → behaviours → opportunities → detections. */
+export const PATH_STAGES = [
+  { id: "subject", label: "Subject", one: "subject", many: "subjects", color: "var(--btn-primary)" },
+  { id: "classification", label: "Classification", one: "classification", many: "classifications", color: "var(--cls-campaign)" },
+  { id: "source", label: "Sources (web search)", one: "source", many: "sources", color: "var(--cls-intel)" },
+  { id: "behaviour", label: "Attack behaviours", one: "behaviour", many: "behaviours", color: "var(--cls-behaviour)" },
+  { id: "opportunity", label: "Detection opportunities", one: "opportunity", many: "opportunities", color: "var(--cls-opportunity)" },
+  { id: "detection", label: "Detections", one: "detection", many: "detections", color: "var(--cls-detection)" },
+] as const;

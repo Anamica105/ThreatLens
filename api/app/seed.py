@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from . import attack, detection
 from .ioc import defang
 from .models import ActivityEvent, ExportLog, Research, Result, Run, User, Workspace
-from .pipeline.stages import _finish_mitre, generate_queries
+from .pipeline.stages import _finish_mitre, generate_queries, select_opportunities, workspace_platforms
 from .records import applicability, coverage_gaps, log_activity, save_record
 
 NOW = datetime.now(timezone.utc)
@@ -39,12 +39,12 @@ WORKSPACES = [
      "field_mappings": {"spl": {"index=endpoint": "index=acme_edr", "index=web": "index=acme_web"}},
      "branding": {"primary": "#5249A8", "disclaimer": "Prepared for Acme Bank. Handle according to the TLP marking."}, "default_tlp": "AMBER"},
     {"id": "northwind", "name": "Northwind Health", "industry": "Healthcare", "color": "#2F8580",
-     "platforms": ["kql_sentinel", "kql_defender", "sigma"],
+     "platforms": ["kql_defender", "sigma"],
      "log_sources": ["process_creation", "file_event", "network", "dns", "file_hash", "vuln_mgmt", "registry"],
      "products": ["SharePoint Server 2019", "Exchange Server 2019", "Microsoft Defender for Endpoint", "Epic EHR"],
      "field_mappings": {}, "branding": {"primary": "#2F8580", "disclaimer": "Northwind Health — internal security use only."},
      "default_tlp": "AMBER"},
-    {"id": "contoso", "name": "Contoso Energy", "industry": "Energy", "color": "#B8790F", "platforms": ["s1ql", "spl", "sigma"],
+    {"id": "contoso", "name": "Contoso Energy", "industry": "Energy", "color": "#B8790F", "platforms": ["spl", "sigma"],
      "log_sources": ["process_creation", "file_event", "network", "dns", "web"],
      "products": ["SharePoint Server Subscription Edition", "SentinelOne Singularity", "Fortinet FortiGate"],
      "field_mappings": {"spl": {"index=endpoint": "index=contoso_sysmon", "index=web": "index=contoso_iis"}},
@@ -180,20 +180,55 @@ IOCS = [
 ]
 
 
-def _toolshell_record(db: Session, research_id: str) -> dict:
+VULNERABILITIES = [
+    {"cve": "CVE-2025-53770", "cvss": 9.8, "epss": None, "kev_added": "2025-07-20", "description": "Deserialization of untrusted data (ToolShell); variant of CVE-2025-49704.",
+     "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
+     "fixed_versions": ["July 2025 security updates"], "patch_kb": ["KB5002768", "KB5002754", "KB5002760"], "source_ids": ["S1", "S2", "S5"]},
+    {"cve": "CVE-2025-53771", "cvss": 6.5, "epss": None, "kev_added": "2025-07-22", "description": "Spoofing / path traversal; bypass of CVE-2025-49706.",
+     "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
+     "fixed_versions": ["July 2025 security updates"], "patch_kb": ["KB5002768", "KB5002754", "KB5002760"], "source_ids": ["S1", "S2"]},
+    {"cve": "CVE-2025-49704", "cvss": 8.8, "epss": None, "kev_added": "2025-07-22", "description": "Code injection leading to remote code execution.",
+     "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
+     "fixed_versions": ["July 2025 Patch Tuesday"], "patch_kb": [], "source_ids": ["S2", "S3", "S5"]},
+    {"cve": "CVE-2025-49706", "cvss": 6.5, "epss": None, "kev_added": "2025-07-22", "description": "Improper authentication (spoofing) via the Referer header.",
+     "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
+     "fixed_versions": ["July 2025 Patch Tuesday"], "patch_kb": [], "source_ids": ["S2", "S3", "S5"]},
+]
+
+ATTACK_PATHS = [
+    {"id": "AP-1", "name": "Exploit → MachineKey theft → ViewState RCE", "steps": [
+        {"ref": "AP-1.1", "behaviour": "POST /_layouts/15/ToolPane.aspx with Referer /_layouts/SignOut.aspx", "technique_id": "T1190", "source_ids": ["S1", "S3"]},
+        {"ref": "AP-1.2", "behaviour": "w3wp.exe → cmd.exe → powershell -EncodedCommand writes spinstall0.aspx", "technique_id": "T1505.003", "source_ids": ["S1", "S3"]},
+        {"ref": "AP-1.3", "behaviour": "GET spinstall0.aspx returns ValidationKey|DecryptionKey", "technique_id": "T1552", "source_ids": ["S1", "S3"]},
+        {"ref": "AP-1.4", "behaviour": "Forged __VIEWSTATE payloads run code as the IIS worker", "technique_id": "T1059.001", "source_ids": ["S3"]}]},
+    {"id": "AP-2", "name": "Web shell → hands-on-keyboard → Warlock via GPO", "steps": [
+        {"ref": "AP-2.1", "behaviour": "whoami and host discovery through the web shell", "technique_id": "T1033", "source_ids": ["S1"]},
+        {"ref": "AP-2.2", "behaviour": "Scheduled tasks and IIS modules for persistence", "technique_id": "T1053.005", "source_ids": ["S1"]},
+        {"ref": "AP-2.3", "behaviour": "Defender disabled through registry changes", "technique_id": "T1562.001", "source_ids": ["S1"]},
+        {"ref": "AP-2.4", "behaviour": "Impacket and PsExec for remote execution", "technique_id": "T1047", "source_ids": ["S1"]},
+        {"ref": "AP-2.5", "behaviour": "Mimikatz dumps LSASS credentials", "technique_id": "T1003.001", "source_ids": ["S1"]},
+        {"ref": "AP-2.6", "behaviour": "Group Policy pushes Warlock ransomware domain-wide", "technique_id": "T1484.001", "source_ids": ["S1"]},
+        {"ref": "AP-2.7", "behaviour": "Files encrypted with Warlock / LockBit Black", "technique_id": "T1486", "source_ids": ["S1", "S4"]}]},
+    {"id": "AP-3", "name": ".NET module in-memory payloads", "steps": [
+        {"ref": "AP-3.1", "behaviour": "IIS_Server_dll.dll registered as an IIS module", "technique_id": "T1505.004", "source_ids": ["S1", "S5"]},
+        {"ref": "AP-3.2", "behaviour": "AK47HTTP beacons over HTTP", "technique_id": "T1071.001", "source_ids": ["S4"]},
+        {"ref": "AP-3.3", "behaviour": "fast reverse proxy (xd.exe) tunnels internal access", "technique_id": "T1090", "source_ids": ["S1"]}]},
+]
+
+
+def _toolshell_record(db: Session, research_id: str, workspace_ids: list[str]) -> dict:
     mitre, _ = _finish_mitre(None, [
         {"technique_id": t, "tactic_id": ta, "procedure": p, "evidence_quote": q, "source_ids": s, "confidence": c}
         for t, ta, p, q, s, c in MITRE_ROWS])
-    opps = []
-    for i, o in enumerate(OPPORTUNITIES, 1):
-        opps.append({**o, "id": f"DO-{i}", "data_sources": [o["spec"]["category"]]})
-    platforms = ["spl", "kql_sentinel", "kql_defender", "cql", "s1ql", "sigma"]
+    # Same selection as the pipeline: de-duplicated, best 1-2 per attack-path step, source trail from the step.
+    opps = select_opportunities([dict(o) for o in OPPORTUNITIES], ATTACK_PATHS, mitre)
+    # Only the platforms the dry-run workspaces actually use (their defaults), Sigma as the neutral source of truth.
+    platforms = workspace_platforms(db, workspace_ids)
     queries = generate_queries(
         db, opps, platforms, 30,
-        {"ipv4": sorted({v for t, v, _, _ in IOCS if t == "ipv4"}), "domain": sorted({v for t, v, _, _ in IOCS if t == "domain"}),
-         "sha256": sorted({v for t, v, _, _ in IOCS if t == "sha256"})},
-        ["CVE-2025-53770", "CVE-2025-53771", "CVE-2025-49704", "CVE-2025-49706"],
-        [m["technique_id"] for m in mitre], [])
+        {t: {v: s for tt, v, _, s in IOCS if tt == t} for t in ("ipv4", "domain", "sha256")},
+        VULNERABILITIES,
+        [m["technique_id"] for m in mitre], [], mitre=mitre, include_generic=False)
     for q in queries:
         if q["opportunity_id"] in ("DO-1", "DO-2", "DO-3") and q["status"] == "syntax_checked":
             q["status"] = "reviewed"
@@ -265,20 +300,7 @@ def _toolshell_record(db: Session, research_id: str) -> dict:
                   "ttp_queries": [q["id"] for q in queries if q["type"] == "ttp"], "platforms": platforms, "lookback_days": 30},
         "industries": [{"industry": i, "evidence": "observed", "source_ids": ["S1", "S3"]} for i in ("Government", "Education", "Healthcare", "Energy")]
                       + [{"industry": "Financial services", "evidence": "assessed", "source_ids": ["S2"]}],
-        "vulnerabilities": [
-            {"cve": "CVE-2025-53770", "cvss": 9.8, "epss": None, "kev_added": "2025-07-20", "description": "Deserialization of untrusted data (ToolShell); variant of CVE-2025-49704.",
-             "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
-             "fixed_versions": ["July 2025 security updates"], "patch_kb": ["KB5002768", "KB5002754", "KB5002760"], "source_ids": ["S1", "S2", "S5"]},
-            {"cve": "CVE-2025-53771", "cvss": 6.5, "epss": None, "kev_added": "2025-07-22", "description": "Spoofing / path traversal; bypass of CVE-2025-49706.",
-             "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
-             "fixed_versions": ["July 2025 security updates"], "patch_kb": ["KB5002768", "KB5002754", "KB5002760"], "source_ids": ["S1", "S2"]},
-            {"cve": "CVE-2025-49704", "cvss": 8.8, "epss": None, "kev_added": "2025-07-22", "description": "Code injection leading to remote code execution.",
-             "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
-             "fixed_versions": ["July 2025 Patch Tuesday"], "patch_kb": [], "source_ids": ["S2", "S3", "S5"]},
-            {"cve": "CVE-2025-49706", "cvss": 6.5, "epss": None, "kev_added": "2025-07-22", "description": "Improper authentication (spoofing) via the Referer header.",
-             "affected_products": ["SharePoint Server 2016", "SharePoint Server 2019", "SharePoint Server Subscription Edition"],
-             "fixed_versions": ["July 2025 Patch Tuesday"], "patch_kb": [], "source_ids": ["S2", "S3", "S5"]},
-        ],
+        "vulnerabilities": VULNERABILITIES,
         "threat_actors": [
             {"name": "Storm-2603", "aliases": ["CL-CRI-1040"], "origin": "China (moderate)", "motivation": ["financial"], "attribution_confidence": "high", "source_ids": ["S1", "S2", "S4"]},
             {"name": "Linen Typhoon", "aliases": ["APT27", "Emissary Panda"], "origin": "China", "motivation": ["espionage"], "attribution_confidence": "high", "source_ids": ["S1"]},
@@ -298,25 +320,7 @@ def _toolshell_record(db: Session, research_id: str) -> dict:
             {"name": "SharpHostInfo", "type": "tool", "role": "Host discovery", "source_ids": ["S1"]},
             {"name": "fast reverse proxy (xd.exe)", "type": "tool", "role": "Tunnelling into the network", "source_ids": ["S1"]},
         ],
-        "attack_paths": [
-            {"id": "AP-1", "name": "Exploit → MachineKey theft → ViewState RCE", "steps": [
-                {"ref": "AP-1.1", "behaviour": "POST /_layouts/15/ToolPane.aspx with Referer /_layouts/SignOut.aspx", "technique_id": "T1190", "source_ids": ["S1", "S3"]},
-                {"ref": "AP-1.2", "behaviour": "w3wp.exe → cmd.exe → powershell -EncodedCommand writes spinstall0.aspx", "technique_id": "T1505.003", "source_ids": ["S1", "S3"]},
-                {"ref": "AP-1.3", "behaviour": "GET spinstall0.aspx returns ValidationKey|DecryptionKey", "technique_id": "T1552", "source_ids": ["S1", "S3"]},
-                {"ref": "AP-1.4", "behaviour": "Forged __VIEWSTATE payloads run code as the IIS worker", "technique_id": "T1059.001", "source_ids": ["S3"]}]},
-            {"id": "AP-2", "name": "Web shell → hands-on-keyboard → Warlock via GPO", "steps": [
-                {"ref": "AP-2.1", "behaviour": "whoami and host discovery through the web shell", "technique_id": "T1033", "source_ids": ["S1"]},
-                {"ref": "AP-2.2", "behaviour": "Scheduled tasks and IIS modules for persistence", "technique_id": "T1053.005", "source_ids": ["S1"]},
-                {"ref": "AP-2.3", "behaviour": "Defender disabled through registry changes", "technique_id": "T1562.001", "source_ids": ["S1"]},
-                {"ref": "AP-2.4", "behaviour": "Impacket and PsExec for remote execution", "technique_id": "T1047", "source_ids": ["S1"]},
-                {"ref": "AP-2.5", "behaviour": "Mimikatz dumps LSASS credentials", "technique_id": "T1003.001", "source_ids": ["S1"]},
-                {"ref": "AP-2.6", "behaviour": "Group Policy pushes Warlock ransomware domain-wide", "technique_id": "T1484.001", "source_ids": ["S1"]},
-                {"ref": "AP-2.7", "behaviour": "Files encrypted with Warlock / LockBit Black", "technique_id": "T1486", "source_ids": ["S1", "S4"]}]},
-            {"id": "AP-3", "name": ".NET module in-memory payloads", "steps": [
-                {"ref": "AP-3.1", "behaviour": "IIS_Server_dll.dll registered as an IIS module", "technique_id": "T1505.004", "source_ids": ["S1", "S5"]},
-                {"ref": "AP-3.2", "behaviour": "AK47HTTP beacons over HTTP", "technique_id": "T1071.001", "source_ids": ["S4"]},
-                {"ref": "AP-3.3", "behaviour": "fast reverse proxy (xd.exe) tunnels internal access", "technique_id": "T1090", "source_ids": ["S1"]}]},
-        ],
+        "attack_paths": ATTACK_PATHS,
         "ioas": [
             {"id": "IOA-1", "description": "w3wp.exe → cmd.exe → powershell -EncodedCommand", "kind": "process_chain", "source_ids": ["S1", "S3"]},
             {"id": "IOA-2", "description": "POST /_layouts/15/ToolPane.aspx?DisplayMode=Edit with Referer /_layouts/SignOut.aspx", "kind": "http_request", "source_ids": ["S3"]},
@@ -460,7 +464,7 @@ def seed(db: Session) -> bool:
     db.flush()
     from .models import Counter
     db.merge(Counter(name=f"research-{NOW.year}", value=142))
-    rec = _toolshell_record(db, r.id)
+    rec = _toolshell_record(db, r.id, r.workspace_ids)
     ws_rows = {w.id: w for w in db.query(Workspace).all()}
     rec["applicability"] = [applicability(rec, ws_rows[w]) for w in r.workspace_ids]
     rec["coverage_gaps"] = [g for w in r.workspace_ids for g in coverage_gaps(rec, ws_rows[w])]
@@ -480,7 +484,8 @@ def seed(db: Session) -> bool:
     r.record = {**r.record, "results": [{"workspace_id": x.workspace_id, "status": x.status, "summary": x.summary, "hunt_window": x.hunt_window,
                                          "queries_run": x.queries_run, "analyst": x.analyst_id} for x in results]}
     db.add(Run(id="RUN-TR-2026-0142-1", research_id=r.id, seed=r.seed, status="done", stage="export", mode="manual",
-               config={"platforms": rec["hunts"]["platforms"], "workspace_ids": r.workspace_ids, "depth": "standard", "lookback_days": 30, "tlp": "AMBER"},
+               config={"platforms": rec["hunts"]["platforms"], "workspace_ids": r.workspace_ids, "depth": "standard", "lookback_days": 30,
+                       "include_generic_hunts": False, "tlp": "AMBER"},
                stage_status={s: {"state": "done"} for s in ["intake", "discovery", "extraction", "synthesis", "attack", "detection", "queries", "iocs", "report", "export"]},
                started_at=_d(2, 8, 0), finished_at=_d(2, 8, 9)))
     for t, msg, u, when in [

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import io
 import json
+import re
 from email.message import EmailMessage
 from email.policy import SMTP
 from pathlib import Path
@@ -81,14 +84,33 @@ def iocs_csv(vm: dict) -> bytes:
 def queries_csv(vm: dict) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["research_id", "query_id", "type", "platform", "title", "status", "techniques", "log_sources", "fp_notes", "query"])
-    for q in vm["rec"].get("hunts", {}).get("queries", []):
-        w.writerow([vm["r"].id, q["id"], q["type"], q["platform"], q["title"], q.get("status", ""), " ".join(q.get("techniques", [])),
-                    "; ".join(q.get("log_sources", [])), q.get("fp_notes", ""), q["body"]])
+    # `query` is the copy-paste-ready text: the chosen workspace's field mappings are applied server-side and `lint` is
+    # re-run on it. `workspace_mapping` names the workspace when its mappings changed the query.
+    w.writerow(["research_id", "query_id", "group", "type", "platform", "title", "status", "provenance", "source_ids", "techniques",
+                "log_sources", "fp_notes", "workspace_mapping", "lint", "query"])
+    ws = vm.get("ws")
+    for q in vm.get("hunt_queries", vm["rec"].get("hunts", {}).get("queries", [])):
+        w.writerow([vm["r"].id, q["id"], q.get("group", ""), q["type"], q["platform"], q["title"], q.get("status", ""),
+                    q.get("provenance", ""), " ".join(q.get("source_ids", [])), " ".join(q.get("techniques", [])),
+                    "; ".join(q.get("log_sources", [])), q.get("fp_notes", ""), ws.id if ws and q.get("mapping_applied") else "",
+                    "; ".join(q.get("lint") or []), q["body"]])
     return buf.getvalue().encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------- 2-slide deck
+
+def _logo_stream(data_uri: str | None):
+    """BytesIO of a raster logo from a workspace `logo_data_uri` (PNG/JPEG/GIF/BMP), else None."""
+    if not data_uri:
+        return None
+    m = re.match(r"data:image/(png|jpe?g|gif|bmp|x-png);base64,(.+)$", data_uri.strip(), re.S | re.I)
+    if not m:
+        return None
+    try:
+        return io.BytesIO(base64.b64decode(m.group(2)))
+    except (ValueError, binascii.Error):
+        return None
+
 
 def pptx(vm: dict) -> bytes:
     from pptx import Presentation
@@ -105,6 +127,32 @@ def pptx(vm: dict) -> bytes:
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     blank = prs.slide_layouts[6]
     FONT = "Atkinson Hyperlegible Next"
+    brand = vm.get("brand_color") or "#5249A8"
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}", brand):
+        brand = "#5249A8"
+    logo = _logo_stream(vm.get("branding", {}).get("logo_data_uri"))
+
+    # Client-brandable master (spec 10): the workspace colour band and logo live on the slide master itself, so every
+    # slide (and any slide the client adds from the Blank layout) carries them.
+    from pptx.shapes.shapetree import SlideShapes
+
+    sm = SlideShapes(prs.slide_master._element.cSld.spTree, prs.slide_master)  # MasterShapes has no add_* methods
+    band = sm.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, prs.slide_width, Inches(0.06))
+    band.fill.solid()
+    band.fill.fore_color.rgb = RGBColor.from_string(brand.lstrip("#").upper())
+    band.line.fill.background()
+    band.name = "ThreatLens brand band"
+    logo_w = 0.0
+    if logo is not None:
+        try:
+            pic = sm.add_picture(logo, Inches(0.5), Inches(7.02), height=Inches(0.34))
+            if pic.width > Inches(1.6):  # keep very wide logos inside the footer
+                ratio = Inches(1.6) / pic.width
+                pic.width, pic.height = Inches(1.6), int(pic.height * ratio)
+            pic.name = "Client logo"
+            logo_w = pic.width / 914400 + 0.15
+        except Exception:  # noqa: BLE001 - unsupported image type (e.g. SVG): deck still renders without a logo
+            logo_w = 0.0
 
     def text(slide, x, y, w, h, s, size=12, bold=False, color="#181C23", mono=False, align=None):
         tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
@@ -148,8 +196,8 @@ def pptx(vm: dict) -> bytes:
         stripe.fill.fore_color.rgb = rgb(vm["sev"]["solid"])
         stripe.line.fill.background()
         line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(0.5), Inches(6.95), Inches(12.83), Inches(6.95))
-        line.line.color.rgb = rgb("#E3E6EB")
-        text(slide, 0.5, 7.0, 9, 0.35, f"{vm['client']}  ·  {r.id}  ·  {vm['now'][:10]}", 12, color="#6A7384")
+        line.line.color.rgb = rgb(brand)
+        text(slide, 0.5 + logo_w, 7.0, 9 - logo_w, 0.35, f"{vm['client']}  ·  {r.id}  ·  {vm['now'][:10]}", 12, color="#6A7384")
         text(slide, 10.3, 7.0, 2.53, 0.35, f"TLP:{vm['tlp']}", 12, True, "#2A303B", align=PP_ALIGN.RIGHT)
 
     def rail(slide, y):
@@ -234,9 +282,13 @@ def pptx(vm: dict) -> bytes:
     text(s2, 0.5, 2.3, 4.9, 1.2, res.get("summary") or "Hunt not yet recorded for this workspace.", 13, color="#3D4452")
     text(s2, 0.5, 3.6, 4.9, 0.3, "Hunt window", 14, True)
     text(s2, 0.5, 3.92, 4.9, 0.4, res.get("hunt_window") or "—", 12, color="#3D4452")
-    text(s2, 0.5, 4.45, 4.9, 0.3, "Queries by type", 14, True)
-    qb = vm["q_by_type"]
-    text(s2, 0.5, 4.77, 4.9, 1.2, [f"IoA  {qb['ioa']}", f"IoC  {qb['ioc']}", f"Vulnerability  {qb['vuln']}", f"TTP  {qb['ttp']}"], 12, color="#3D4452")
+    # "# queries run by type" from the workspace result; generated counts (labelled) when no run was recorded.
+    qb = vm.get("q_run_by_type") or vm["q_by_type"]
+    text(s2, 0.5, 4.45, 4.9, 0.3, vm.get("q_run_label", "Queries by type"), 14, True)
+    lines = [f"IoA  {qb.get('ioa', 0)}", f"IoC  {qb.get('ioc', 0)}", f"Vulnerability  {qb.get('vuln', 0)}", f"TTP  {qb.get('ttp', 0)}"]
+    if qb.get("other"):
+        lines.append(f"Other  {qb['other']}")
+    text(s2, 0.5, 4.77, 4.9, 1.2, lines, 12, color="#3D4452")
 
     text(s2, 5.9, 1.2, 6.9, 0.3, "Top recommendations", 14, True)
     y = 1.6
