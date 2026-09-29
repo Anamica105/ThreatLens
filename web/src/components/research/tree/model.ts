@@ -244,6 +244,13 @@ export function branchIds(root: TNode): string[] {
 /** Default: collapsed below level 3 (subject and classifications open, behaviours shown collapsed). */
 export const defaultExpanded = (root: TNode) => new Set(["root", ...root.children.map((c) => c.id)]);
 
+/** Tree canvas opening state: every classification visible, only the first non-empty one expanded (the tree is an
+ *  accordion, so this is the same state a click produces, and it keeps the canvas short enough to read). */
+export const treeDefaultExpanded = (root: TNode) => {
+  const first = root.children.find((c) => c.children.length);
+  return new Set(["root", ...(first ? [first.id] : [])]);
+};
+
 /** Accordion toggle: opening a node closes its open siblings; clicking the only open sibling closes it. */
 export function accordion(expanded: Set<string>, node: TNode, parent: TNode | null): Set<string> {
   const next = new Set(expanded);

@@ -10,7 +10,7 @@ import { Button, ButtonGroup } from "../../ui/button";
 import { Input } from "../../ui/forms";
 import { Menu, Tooltip } from "../../ui/overlay";
 import { NodeDrawer, nodeColor } from "../tree/details";
-import { accordion, branchIds, buildResearchTree, defaultExpanded, findPath, levelCounts, type TKind, type TNode } from "../tree/model";
+import { accordion, branchIds, buildResearchTree, findPath, levelCounts, treeDefaultExpanded, type TKind, type TNode } from "../tree/model";
 import type { DetailProps } from "./common";
 
 const WIDTH: Record<TKind, number> = { subject: 260, class: 230, behaviour: 270, opportunity: 250, detection: 140 };
@@ -19,6 +19,13 @@ const COL_X = [0, 324, 618, 952, 1266];
 /** Spec §12: above this many laid-out nodes only what is in the viewport (plus a margin) is rendered. */
 const VIRTUAL_AT = 500;
 const MARGIN = 300;
+
+/** Height of the canvas that is actually on screen: it often starts low on the page and runs below the fold,
+ *  so fitting and centring use this rather than the full element height. */
+function visibleHeight(el: HTMLElement) {
+  const top = Math.max(0, el.getBoundingClientRect().top);
+  return Math.max(240, Math.min(el.clientHeight, window.innerHeight - top - 16));
+}
 
 function wrap(text: string, width: number, lines: number, px = 7.2): string[] {
   const max = Math.max(4, Math.floor(width / px));
@@ -49,7 +56,7 @@ export function TreeTab({ d, canEdit }: DetailProps) {
   const wsHref = useWsHref();
   const rec = d.record;
   const root = useMemo(() => buildResearchTree(d, (p) => platformName(p, true)), [d, platformName]);
-  const [expanded, setExpanded] = useState<Set<string>>(() => defaultExpanded(root));
+  const [expanded, setExpanded] = useState<Set<string>>(() => treeDefaultExpanded(root));
   const [selected, setSelected] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string>("root");
   const [q, setQ] = useState("");
@@ -116,7 +123,7 @@ export function TreeTab({ d, canEdit }: DetailProps) {
     const n = byId.get(centerReq.id);
     const el = box.current;
     if (!n || !el) return;
-    setView((v) => ({ ...v, x: el.clientWidth / 2 - (COL_X[n.depth] + WIDTH[n.data.kind] / 2) * v.k, y: el.clientHeight / 2 - n.x * v.k }));
+    setView((v) => ({ ...v, x: el.clientWidth / 2 - (COL_X[n.depth] + WIDTH[n.data.kind] / 2) * v.k, y: visibleHeight(el) / 2 - n.x * v.k }));
     setCenterReq(null);
   }, [centerReq, byId]);
 
@@ -131,14 +138,18 @@ export function TreeTab({ d, canEdit }: DetailProps) {
     const el = box.current;
     if (!el) return;
     const h = layout.maxY - layout.minY + 40;
-    const k = Math.min(1.2, Math.max(min, Math.min((el.clientWidth - 40) / layout.width, (el.clientHeight - 40) / h)));
+    const vh = visibleHeight(el);
+    const k = Math.min(1, Math.max(min, Math.min((el.clientWidth - 40) / layout.width, (vh - 40) / h)));
     const rootY = byId.get("root")?.x ?? 0;
     // When the whole tree cannot be read at this zoom, keep the subject in the middle instead.
     const cy = k > min ? (layout.minY + layout.maxY) / 2 : rootY;
-    setView({ k, x: 20, y: el.clientHeight / 2 - cy * k });
+    setView({ k, x: 20, y: vh / 2 - cy * k });
   }, [layout, byId]);
 
-  useEffect(() => { fit(0.7); /* initial: readable zoom */ }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Fit once the layout for the requested expansion state exists (on open and after "Reset view").
+  const [fitReq, setFitReq] = useState(1);
+  useEffect(() => { if (fitReq) { fit(0.55); setFitReq(0); } }, [fitReq, fit]);
+  const resetView = () => { setExpanded(treeDefaultExpanded(root)); setSelected(null); setFitReq((n) => n + 1); };
 
   const zoom = (f: number) => setView((v) => {
     const el = box.current!;
@@ -251,7 +262,7 @@ export function TreeTab({ d, canEdit }: DetailProps) {
           <Button size="sm" aria-label="Zoom in" onClick={() => zoom(1.2)}><Plus /></Button>
           <Button size="sm" icon={<Maximize />} onClick={() => fit()}>Fit</Button>
           <Button size="sm" icon={<ChevronsUpDown />} onClick={() => setExpanded(new Set(all))}>Expand all</Button>
-          <Button size="sm" icon={<ChevronsDownUp />} onClick={() => setExpanded(defaultExpanded(root))}>Collapse to level 3</Button>
+          <Button size="sm" icon={<ChevronsDownUp />} onClick={resetView}>Reset view</Button>
         </ButtonGroup>
         <Input inputSize="sm" className="w-56" prefixIcon={<Search />} placeholder="Search nodes" value={q} aria-label="Search the tree"
           onChange={(e) => { setQ(e.target.value); setMatchIdx(0); }} onKeyDown={(e) => { if (e.key === "Enter") setMatchIdx((i) => i + 1); }}
