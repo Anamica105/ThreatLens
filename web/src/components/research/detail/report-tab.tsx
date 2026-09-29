@@ -3,7 +3,8 @@
 import clsx from "clsx";
 import { Check, Pencil, Plus, Trash2, TriangleAlert } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { HORIZON, SEVERITY, SEVERITIES } from "@/lib/constants";
 import { utc } from "@/lib/format";
 import type { ResearchRecord, ResultStatus, Severity } from "@/lib/types";
@@ -21,7 +22,9 @@ import { AttackPathDialog, deleteMitre, EditedMark, MitreDialog } from "../revie
 import { canReviewEdit, isEdited, isReviewer, type AttackPathE, type MitreRowE, type Readiness } from "../review/readiness";
 import { IocValue } from "../ioc-value";
 import { groupAnchor, groupQueries } from "../provenance";
-import { SectionHeading, SourceRefs, type DetailProps, Quote } from "./common";
+import { CommentButton, ThreadPanel } from "../comments/thread-panel";
+import { ANCHOR_BY_SECTION, SECTION_BY_ANCHOR, sectionLabel, useComments, type SectionCount } from "../comments/model";
+import { SectionHeading, SourceRefs, WsLink, type DetailProps, Quote } from "./common";
 
 const TOC = [
   ["executive-summary", "Executive summary"], ["impact", "Impact"], ["recommendations", "Recommendations"], ["result", "Result"],
@@ -29,6 +32,19 @@ const TOC = [
   ["ioas", "Indicators of attack"], ["tools", "Tools used"], ["workflow", "Workflow"], ["hunts", "Hunts"], ["iocs", "IoCs"],
   ["industries", "Industries"], ["timeline", "Timeline"],
 ] as const;
+
+const ThreadCtx = createContext<{ counts: Record<string, SectionCount>; open: (section: string | null | undefined) => void }>({ counts: {}, open: () => {} });
+
+/** Section heading with a comment count button that opens the section's thread panel. */
+function H({ id, actions, children }: { id: string; actions?: React.ReactNode; children: React.ReactNode }) {
+  const { counts, open } = useContext(ThreadCtx);
+  const section = SECTION_BY_ANCHOR[id];
+  return (
+    <SectionHeading id={id} actions={<>{actions}{section && <CommentButton count={counts[section]} label={sectionLabel(section)} onClick={() => open(section)} />}</>}>
+      {children}
+    </SectionHeading>
+  );
+}
 
 export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, readiness }: DetailProps & { tacticFilter: string | null; readiness?: Readiness }) {
   const rec = d.record;
@@ -51,6 +67,27 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
   const [editing, setEditing] = useState<null | "summary" | "impact" | "recs" | "title">(null);
   const toast = useToast();
   const wsHref = useWsHref();
+  // Section comment threads (B19): ?thread=<section key>&c=<comment id> opens the side panel (notification links use it).
+  const params = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const comments = useComments(d.id);
+  const threadParam = params.get("thread");
+  const threadSection = threadParam === "general" ? null : threadParam;
+  const setThread = useCallback((section: string | null | undefined) => {
+    const p = new URLSearchParams(params.toString());
+    p.delete("c");
+    if (section === undefined) p.delete("thread");
+    else p.set("thread", section ?? "general");
+    router.replace(`${pathname}?${p.toString()}`, { scroll: false });
+  }, [params, pathname, router]);
+  useEffect(() => {
+    if (!threadSection) return;
+    const anchor = ANCHOR_BY_SECTION[threadSection];
+    const t = setTimeout(() => anchor && document.getElementById(anchor)?.scrollIntoView({ block: "start" }), 120);
+    return () => clearTimeout(t);
+  }, [threadSection]);
+  const threadCtx = useMemo(() => ({ counts: comments.data?.counts ?? {}, open: setThread }), [comments.data, setThread]);
 
   useEffect(() => {
     const els = TOC.map(([id]) => document.getElementById(id)).filter(Boolean) as HTMLElement[];
@@ -101,6 +138,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
   const wsGaps = (rec.coverage_gaps ?? []).filter((g) => ws === "all" || g.workspace_id === ws);
 
   return (
+    <ThreadCtx.Provider value={threadCtx}>
     <div className="grid gap-8 xl:grid-cols-[200px_minmax(0,1fr)_320px] lg:grid-cols-[minmax(0,1fr)_300px]">
       <nav aria-label="On this page" className="hidden xl:block">
         <div className="sticky top-32">
@@ -118,21 +156,21 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
       <article className="min-w-0 space-y-10">
         {rec.demo_note && <p className="rounded-md border border-line bg-subtle px-4 py-3 text-body-sm text-fg-strong">{rec.demo_note}</p>}
         <section>
-          <SectionHeading id="executive-summary" actions={<>
+          <H id="executive-summary" actions={<>
             <ReviewBar section="executive_summary" />
             {canEdit && <Button size="sm" variant="tertiary" icon={<Pencil />} onClick={() => setEditing("summary")}>Edit</Button>}
-          </>}>Executive summary</SectionHeading>
+          </>}>Executive summary</H>
           <div className="reading space-y-4 text-body-lg">
             {rec.executive_summary.split(/\n\n+/).map((p, i) => <p key={i}>{p}</p>)}
           </div>
         </section>
 
         <section>
-          <SectionHeading id="impact" actions={<>
+          <H id="impact" actions={<>
             <ReviewBar section="impact" />
             <ReviewBar section="claims" />
             {canEdit && <Button size="sm" variant="tertiary" icon={<Pencil />} onClick={() => setEditing("impact")}>Edit</Button>}
-          </>}>Impact</SectionHeading>
+          </>}>Impact</H>
           <div className="reading space-y-3 text-body-lg">
             <div className="flex flex-wrap items-center gap-2">
               <SeverityBadge severity={rec.impact.severity} />
@@ -154,10 +192,10 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="recommendations" actions={<>
+          <H id="recommendations" actions={<>
             <ReviewBar section="recommendations" />
             {canEdit && <Button size="sm" variant="tertiary" icon={<Pencil />} onClick={() => setEditing("recs")}>Edit</Button>}
-          </>}>Recommendations</SectionHeading>
+          </>}>Recommendations</H>
           {rec.patching_insufficient && (
             <div className="mb-4 flex items-center gap-2 rounded-md border px-4 py-2.5 text-[14px] font-semibold" style={{ background: "var(--warning-soft)", borderColor: "var(--warning-border)", color: "var(--warning)" }}>
               <TriangleAlert className="size-5" /> Patching alone is insufficient for this threat.
@@ -185,20 +223,20 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="result">Result</SectionHeading>
+          <H id="result">Result</H>
           <ResultsTable d={d} ws={ws} reload={reload} canEdit={canEdit} />
         </section>
 
         {rec.vulnerabilities.length > 0 && (
           <section>
-            <SectionHeading id="vulnerabilities" actions={<ReviewBar section="vulnerabilities" />}>Vulnerabilities</SectionHeading>
+            <H id="vulnerabilities" actions={<ReviewBar section="vulnerabilities" />}>Vulnerabilities</H>
             <VulnTable d={d} canEdit={canEdit} onRefreshed={reload} />
           </section>
         )}
 
         {rec.threat_actors.length > 0 && (
           <section>
-            <SectionHeading id="actors" actions={<ReviewBar section="threat_actors" />}>Threat actors</SectionHeading>
+            <H id="actors" actions={<ReviewBar section="threat_actors" />}>Threat actors</H>
             <div className="grid gap-3 md:grid-cols-2">
               {rec.threat_actors.map((a) => (
                 <div key={a.name} className="rounded-md border border-line bg-surface p-4">
@@ -216,10 +254,10 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
 
         {rec.attack_paths.length > 0 && (
           <section>
-            <SectionHeading id="attack-paths" actions={<>
+            <H id="attack-paths" actions={<>
               <ReviewBar section="attack_paths" />
               {editable && <Button size="sm" variant="tertiary" icon={<Plus />} onClick={() => setPathEdit({ path: null })}>Add path</Button>}
-            </>}>Attack paths</SectionHeading>
+            </>}>Attack paths</H>
             <div className="space-y-4">
               {rec.attack_paths.map((p, pi) => (
                 <div key={p.id} className="rounded-md border border-line bg-surface p-4">
@@ -247,18 +285,18 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         )}
 
         <section>
-          <SectionHeading id="mitre" actions={<>
+          <H id="mitre" actions={<>
             {tacticFilter && <Badge tone="accent">Filtered to one tactic</Badge>}
             <ReviewBar section="mitre" />
             {editable && <Button size="sm" variant="tertiary" icon={<Plus />} onClick={() => setMitreEdit({})}>Add technique</Button>}
-          </>}>MITRE ATT&amp;CK</SectionHeading>
+          </>}>MITRE ATT&amp;CK</H>
           <MitreTable rows={mitre} sources={sources} canEdit={editable} flagOf={(m) => flagged.get(`mitre:${rec.mitre.indexOf(m)}`)}
             onEdit={(m) => setMitreEdit({ row: m, index: rec.mitre.indexOf(m) })} onRemove={removeMitre} />
         </section>
 
         {rec.detection_opportunities.length > 0 && (
           <section>
-            <SectionHeading id="opportunities" actions={<Link href="?tab=path" className="text-[14px] font-semibold text-accent-text hover:underline">Trace in Research path</Link>}>Detection opportunities</SectionHeading>
+            <H id="opportunities" actions={<WsLink href="?tab=path" className="text-[14px] font-semibold text-accent-text hover:underline">Trace in Research path</WsLink>}>Detection opportunities</H>
             <ul className="space-y-2">
               {rec.detection_opportunities.map((o) => {
                 const step = steps.find((s) => s.ref === o.behaviour_ref);
@@ -269,7 +307,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
                       <span className="font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{o.id}</span>
                       <span className="min-w-0 text-h4 font-semibold break-words">{o.title}</span>
                       <SourceRefs ids={o.source_ids?.length ? o.source_ids : step?.source_ids ?? []} sources={sources} />
-                      {g && <Link href={`?tab=hunts#${groupAnchor(g.key)}`} className="ml-auto text-body-sm font-semibold text-accent-text hover:underline">{g.queries.length} queries</Link>}
+                      {g && <WsLink href={`?tab=hunts#${groupAnchor(g.key)}`} className="ml-auto text-body-sm font-semibold text-accent-text hover:underline">{g.queries.length} queries</WsLink>}
                     </div>
                     <p className="mt-1 text-[14px] break-words">{o.logic}</p>
                     {step && <p className="mt-1 text-caption text-fg-muted break-words">From {step.ref}: {step.behaviour}</p>}
@@ -282,7 +320,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
 
         {rec.ioas?.length > 0 && (
           <section>
-            <SectionHeading id="ioas">Indicators of attack</SectionHeading>
+            <H id="ioas">Indicators of attack</H>
             <ul className="space-y-2">
               {rec.ioas.map((i) => (
                 <li key={i.id} className="flex items-start gap-3 rounded-md border border-line bg-surface px-4 py-3">
@@ -296,7 +334,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         )}
 
         <section>
-          <SectionHeading id="tools" actions={<ReviewBar section="malware_tools" />}>Tools used</SectionHeading>
+          <H id="tools" actions={<ReviewBar section="malware_tools" />}>Tools used</H>
           {rec.tools_used.length ? (
             <ul className="flex flex-wrap gap-2">{rec.tools_used.map((t) => <li key={t.name}><Chip title={t.detail}>{t.name}</Chip></li>)}</ul>
           ) : <p className="text-fg-muted">None recorded.</p>}
@@ -319,7 +357,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="workflow">Workflow</SectionHeading>
+          <H id="workflow">Workflow</H>
           <ol className="space-y-0">
             {rec.workflow.map((w, i) => (
               <li key={i} className="relative flex gap-3 pb-4">
@@ -338,7 +376,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="hunts" actions={<Link href="?tab=hunts" className="text-[14px] font-semibold text-accent-text hover:underline">Open Hunts tab</Link>}>Hunts</SectionHeading>
+          <H id="hunts" actions={<WsLink href="?tab=hunts" className="text-[14px] font-semibold text-accent-text hover:underline">Open Hunts tab</WsLink>}>Hunts</H>
           <p className="reading text-body-lg">
             {detections.length} detection{detections.length === 1 ? "" : "s"} ({nDet("ioa")} IoA, {nDet("ioc")} IoC, {nDet("vuln")} vulnerability and {nDet("ttp")} TTP)
             as {rec.hunts?.queries?.length ?? 0} platform variants across {rec.hunts.platforms.length} platform{rec.hunts.platforms.length === 1 ? "" : "s"}, with a {rec.hunts.lookback_days}-day look-back.
@@ -354,7 +392,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="iocs" actions={<Link href="?tab=iocs" className="text-[14px] font-semibold text-accent-text hover:underline">All {rec.iocs.length} IoCs</Link>}>IoCs</SectionHeading>
+          <H id="iocs" actions={<WsLink href="?tab=iocs" className="text-[14px] font-semibold text-accent-text hover:underline">All {rec.iocs.length} IoCs</WsLink>}>IoCs</H>
           {rec.iocs.length ? (
             <ul className="space-y-1.5">
               {rec.iocs.filter((i) => i.verdict === "malicious" || i.verdict === "suspicious").slice(0, 10).map((i) => (
@@ -365,7 +403,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         </section>
 
         <section>
-          <SectionHeading id="industries" actions={<ReviewBar section="industries" />}>Industries</SectionHeading>
+          <H id="industries" actions={<ReviewBar section="industries" />}>Industries</H>
           <div className="flex flex-wrap gap-2">
             {rec.industries.map((i) => <span key={i.industry} className="inline-flex max-w-full items-center"><Chip title={`${i.evidence} · ${i.source_ids.join(", ")}`}>{i.industry} <span className="text-fg-muted">· {i.evidence}</span></Chip><SourceRefs ids={i.source_ids} sources={sources} /></span>)}
             {!rec.industries.length && <p className="text-fg-muted">No targeted industries identified.</p>}
@@ -375,7 +413,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
 
         {rec.timeline.length > 0 && (
           <section>
-            <SectionHeading id="timeline">Timeline</SectionHeading>
+            <H id="timeline">Timeline</H>
             <ol>
               {rec.timeline.map((t, i) => (
                 <li key={i} className="relative flex gap-3 pb-4">
@@ -441,6 +479,10 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
         )}
       </aside>
 
+      {threadParam !== null && (
+        <ThreadPanel rid={d.id} section={threadSection} data={comments.data} reload={comments.reload} onClose={() => setThread(undefined)}
+          focus={params.get("c") ? Number(params.get("c")) : null} />
+      )}
       <MitreDialog open={!!mitreEdit} onClose={() => setMitreEdit(null)} rid={d.id} sources={rec.sources} row={mitreEdit?.row} index={mitreEdit?.index} onSaved={reload} />
       <AttackPathDialog open={!!pathEdit} onClose={() => setPathEdit(null)} rid={d.id} path={pathEdit?.path ?? null} sources={rec.sources} onSaved={reload} />
       <EditSummaryDialog open={editing === "summary"} onClose={() => setEditing(null)} value={rec.executive_summary}
@@ -450,6 +492,7 @@ export function ReportTab({ d, reload, patchRecord, canEdit, ws, tacticFilter, r
       <EditRecsDialog open={editing === "recs"} onClose={() => setEditing(null)} recs={rec.recommendations} patchingInsufficient={rec.patching_insufficient}
         onSave={async (recommendations, patching_insufficient) => { await patchRecord({ recommendations, patching_insufficient }, "Edited recommendations"); setEditing(null); }} />
     </div>
+    </ThreadCtx.Provider>
   );
 }
 

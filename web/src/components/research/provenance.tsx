@@ -5,6 +5,7 @@ import Link from "next/link";
 import { PROVENANCE, QUERY_STATUS_ORDER } from "@/lib/constants";
 import { refang } from "@/lib/format";
 import type { Provenance, ProvenanceItem, Query, ResearchRecord, Source } from "@/lib/types";
+import { useWsHref } from "../providers";
 import { Badge } from "../ui/badges";
 import { Tooltip } from "../ui/overlay";
 
@@ -76,6 +77,7 @@ export function ProvenanceBadge({ provenance }: { provenance: Provenance }) {
 
 /** Publisher chips for a list of source IDs; each links to its card on the Sources tab, with the article one click away. */
 export function SourceChips({ ids, sources, label = "From", empty, compact }: { ids: string[]; sources: Record<string, Source>; label?: string; empty?: React.ReactNode; compact?: boolean }) {
+  const wsHref = useWsHref();
   if (!ids.length) return empty ? <span className="text-caption text-fg-muted">{empty}</span> : null;
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-1">
@@ -85,7 +87,7 @@ export function SourceChips({ ids, sources, label = "From", empty, compact }: { 
         return (
           <span key={id} className={`inline-flex h-6 min-w-0 items-center overflow-hidden rounded-sm bg-chip text-[12px] font-medium text-chip-fg ${compact ? "max-w-[150px]" : "max-w-[240px]"}`}>
             <Tooltip content={s ? `${s.publisher} — ${s.title}` : `Source ${id}`}>
-              <Link href={`?tab=sources#source-${id}`} className="flex min-w-0 items-center gap-1 px-1.5 hover:bg-[var(--g-100)] dark:hover:bg-[#2E3440]">
+              <Link href={wsHref(`?tab=sources#source-${id}`)} className="flex min-w-0 items-center gap-1 px-1.5 hover:bg-[var(--g-100)] dark:hover:bg-[#2E3440]">
                 <span className="font-mono text-[11px] text-fg-muted">{id}</span>
                 <span className="truncate">{s?.publisher ?? "Unknown source"}</span>
               </Link>

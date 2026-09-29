@@ -121,9 +121,9 @@ MIN_INTERVAL = {"virustotal": 15.5, "abuseipdb": 1.0, "greynoise": 1.0, "abusech
 
 
 def get_keys(db: Session) -> dict[str, str]:
-    s = get_settings()
-    stored = (db.get(Setting, "osint_keys") or Setting(value={})).value or {}
-    return {p["id"]: stored.get(p["id"]) or getattr(s, p["env"], "") for p in PROVIDERS}
+    """Decrypted OSINT keys (stored values are encrypted at rest; env vars as fallback)."""
+    from .secrets import get_osint_keys  # local import: secrets imports this module
+    return get_osint_keys(db)
 
 
 def _throttle(provider: str) -> None:

@@ -16,6 +16,8 @@ import { CommandPalette } from "./command-palette";
 import { WorkspaceSwitcher } from "./workspace-switcher";
 import { useLocalStorage, useApi } from "@/lib/hooks";
 import { relative } from "@/lib/format";
+import { post } from "@/lib/api";
+import { threadHref, type NotificationsResponse } from "../research/comments/model";
 
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard, key: "d" },
@@ -278,22 +280,51 @@ export function Logo({ size = 24 }: { size?: number }) {
   );
 }
 
+/** Top-bar bell: @mentions and replies on comment threads (unread dot), then recent research activity. */
 function Notifications() {
+  const { user } = useApp();
   const { data } = useApi<{ recent: { id: string; title: string; status: string; updated_at: string }[] }>("/api/dashboard?period=quarter", { interval: 60000 });
+  const { data: notes, reload } = useApi<NotificationsResponse>(user ? `/api/research/notifications?u=${user.id}` : null, { interval: 30000 });
   const wsHref = useWsHref();
   const items = data?.recent ?? [];
+  const mentions = notes?.items ?? [];
+  const unread = notes?.unread ?? 0;
+  const markRead = async (ids: number[]) => {
+    try { await post("/api/research/notifications/read", { ids }); await reload(); } catch { /* best effort */ }
+  };
   return (
-    <Popover align="end" width={340} label="Notifications" trigger={(p) => (
-      <button {...p} className="relative grid size-9 place-items-center rounded-sm text-fg-muted hover:bg-subtle" aria-label="Notifications">
+    <Popover align="end" width={360} label="Notifications" trigger={(p) => (
+      <button {...p} className="relative grid size-9 place-items-center rounded-sm text-fg-muted hover:bg-subtle"
+        aria-label={unread ? `Notifications, ${unread} unread` : "Notifications"}>
         <Bell className="size-5" />
-        {items.some((i) => i.status === "in_review") && <span className="absolute top-2 right-2 size-2 rounded-full bg-accent" />}
+        {(unread > 0 || items.some((i) => i.status === "in_review")) && <span className={clsx("absolute top-2 right-2 size-2 rounded-full", unread > 0 ? "bg-danger" : "bg-accent")} />}
       </button>
     )}>
       {(close) => (
-        <div className="p-2">
-          <div className="px-2 py-1 text-h4 font-semibold">Recent activity</div>
+        <div className="max-h-[70vh] overflow-y-auto p-2">
+          <div className="flex items-center justify-between px-2 py-1">
+            <span className="text-h4 font-semibold">Mentions{unread > 0 && <span className="ml-1.5 rounded-full bg-danger px-1.5 text-caption font-semibold text-white tabular">{unread}</span>}</span>
+            {unread > 0 && <button type="button" onClick={() => markRead([])} className="text-caption font-semibold text-accent-text hover:underline">Mark all read</button>}
+          </div>
+          {mentions.length === 0 && <p className="px-2 py-2 text-body-sm text-fg-muted">No mentions yet.</p>}
+          {mentions.slice(0, 8).map((n) => (
+            <Link key={n.id} onClick={() => { if (!n.read) markRead([n.id]); close(); }}
+              href={wsHref(threadHref(n.research_id, n.section, n.comment_id))}
+              className={clsx("flex gap-2 rounded-sm px-2 py-2 hover:bg-subtle", !n.read && "bg-accent-soft")}>
+              <Avatar initials={n.by?.initials} size={24} />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[14px]">
+                  <span className="font-semibold">{n.by?.name ?? "Someone"}</span> {n.kind === "reply" ? "replied" : "mentioned you"} on <span className="font-semibold">{n.section_label}</span> · <span className="font-mono text-mono-sm">{n.research_id}</span>
+                </span>
+                <span className="block truncate text-caption text-fg-muted">{n.message}</span>
+                <span className="block text-caption text-fg-muted">{relative(n.created_at)}</span>
+              </span>
+              {!n.read && <span className="mt-2 size-2 shrink-0 rounded-full bg-danger" aria-label="Unread" />}
+            </Link>
+          ))}
+          <div className="mt-1 border-t border-line px-2 pt-2 pb-1 text-h4 font-semibold">Recent activity</div>
           {items.length === 0 && <p className="px-2 py-3 text-fg-muted">Nothing new.</p>}
-          {items.map((i) => (
+          {items.slice(0, 6).map((i) => (
             <Link key={i.id} href={wsHref(`/research/${i.id}`)} onClick={close} className="block rounded-sm px-2 py-2 hover:bg-subtle">
               <div className="truncate text-[14px]">{i.title}</div>
               <div className="text-caption text-fg-muted"><span className="font-mono">{i.id}</span> · {i.status.replace("_", " ")} · {relative(i.updated_at)}</div>

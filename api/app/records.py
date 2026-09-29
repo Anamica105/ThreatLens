@@ -438,15 +438,73 @@ def required_categories(record: dict) -> set[str]:
     return cats
 
 
-def coverage_gaps(record: dict, ws: Workspace) -> list[dict]:
-    have = set(ws.log_sources or [])
-    gaps = []
-    for do in record.get("detection_opportunities", []):
-        for cat in do.get("data_sources", []):
-            if cat not in have:
-                gaps.append({"workspace_id": ws.id, "behaviour_ref": do.get("behaviour_ref"), "opportunity_id": do.get("id"),
-                             "data_source": cat, "detail": f"{ws.name} has no {LOG_SOURCES.get(cat, {}).get('windows', cat)} telemetry"})
+def _ws_attr(ws, key: str, default=None):
+    return ws.get(key, default) if isinstance(ws, dict) else getattr(ws, key, default)
+
+
+def _source_label(cat: str) -> str:
+    return LOG_SOURCES.get(cat, {}).get("windows", cat)
+
+
+_GAP_KIND = {"ioc": "IoC retro-hunt", "vuln": "vulnerability exposure", "ttp": "TTP hunt"}
+
+
+def compute_coverage_gaps(record: dict, workspaces) -> list[dict]:
+    """Coverage gaps (spec 8): every data source the record's hunts need that a workspace does not collect.
+
+    Pure: depends only on the record and the workspaces' CURRENT `log_sources` (Workspace rows or dicts with id, name,
+    log_sources), so call it on read to reflect workspace edits. Covers
+      * detection opportunities (their `data_sources`; one gap per opportunity, as before), and
+      * every other generated query group: IoC retro-hunts (network / dns / file_hash), vulnerability exposure
+        (vuln_mgmt) and generic TTP hunts; one gap per (group, data source). Vendor reference queries are skipped.
+    Gap: {workspace_id, data_source, detail, kind, behaviour_ref, opportunity_id, group, query_type}."""
+    opps = record.get("detection_opportunities", []) or []
+    opp_ids = {o.get("id") for o in opps}
+    groups: dict[str, dict] = {}
+    for q in (record.get("hunts") or {}).get("queries", []) or []:
+        if q.get("origin") == "reference" or (q.get("opportunity_id") and q["opportunity_id"] in opp_ids):
+            continue
+        g = groups.setdefault(q.get("group") or q.get("id"), {"type": q.get("type"), "title": q.get("title", ""), "cats": []})
+        for cat in q.get("data_sources", []) or []:
+            if cat not in g["cats"]:
+                g["cats"].append(cat)
+    gaps: list[dict] = []
+    for ws in workspaces or []:
+        if ws is None:
+            continue
+        wid, name = _ws_attr(ws, "id"), _ws_attr(ws, "name") or _ws_attr(ws, "id")
+        have = set(_ws_attr(ws, "log_sources") or [])
+        for do in opps:
+            for cat in do.get("data_sources", []) or []:
+                if cat not in have:
+                    gaps.append({"workspace_id": wid, "behaviour_ref": do.get("behaviour_ref"), "opportunity_id": do.get("id"),
+                                 "group": None, "query_type": do.get("type"), "kind": "detection", "data_source": cat,
+                                 "detail": f"{name} has no {_source_label(cat)} telemetry"})
+        for gid, g in groups.items():
+            for cat in g["cats"]:
+                if cat not in have:
+                    what = _GAP_KIND.get(g["type"], "hunt")
+                    gaps.append({"workspace_id": wid, "behaviour_ref": None, "opportunity_id": None, "group": gid,
+                                 "query_type": g["type"], "kind": g["type"] or "hunt", "data_source": cat,
+                                 "detail": f"{name} has no {_source_label(cat)} telemetry for the {what} ({gid})"})
     return gaps
+
+
+def coverage_gaps(record: dict, ws: Workspace) -> list[dict]:
+    """Gaps for one workspace (see compute_coverage_gaps)."""
+    return compute_coverage_gaps(record, [ws])
+
+
+def refresh_coverage_gaps(db: Session, record: dict, workspace_ids=None) -> dict:
+    """Read-time hook: recompute record["coverage_gaps"] from the workspaces' current log sources. `workspace_ids`
+    defaults to the workspaces already referenced by the stored gaps / applicability. Mutates and returns `record`
+    (pass a copy of Research.record)."""
+    if workspace_ids is None:
+        workspace_ids = list(dict.fromkeys([g.get("workspace_id") for g in record.get("coverage_gaps", []) or []] +
+                                           [a.get("workspace_id") for a in record.get("applicability", []) or []]))
+    wss = [db.get(Workspace, w) for w in workspace_ids or [] if w]
+    record["coverage_gaps"] = compute_coverage_gaps(record, [w for w in wss if w is not None])
+    return record
 
 
 def ensure_results(db: Session, r: Research) -> None:

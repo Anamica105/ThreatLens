@@ -45,6 +45,25 @@ class Settings(BaseSettings):
     # View audit (spec section 13): one row per user + entity per window.
     audit_dedupe_minutes: int = 10
 
+    # Secrets at rest (spec section 13: OSINT keys in a vault). Fernet key for values stored in the `setting` table.
+    # Env THREATLENS_SECRET_KEY; if empty, one is generated into <data_dir>/.secret_key (gitignored) with a warning.
+    threatlens_secret_key: str = ""
+
+    # Auth (spec section 12: SSO via OIDC).
+    #   dev    - trust the `X-User` header sent by the web app's user switcher (falls back to the first user). Local only.
+    #   header - trust only `auth_header` (an email set by an OIDC-validating reverse proxy such as oauth2-proxy),
+    #            and only when the TCP peer is in `auth_trusted_proxies`. `X-User` is ignored.
+    #   oidc   - native bearer-token validation; not implemented yet (501). Planned keys: oidc_issuer,
+    #            oidc_audience, oidc_jwks_url (default <issuer>/.well-known/jwks.json), oidc_email_claim, oidc_role_claim.
+    auth_mode: str = "dev"
+    auth_header: str = "X-Forwarded-Email"
+    auth_trusted_proxies: str = "127.0.0.1,::1"  # comma-separated IPs or CIDRs
+    oidc_issuer: str = ""
+    oidc_audience: str = ""
+    oidc_jwks_url: str = ""
+    oidc_email_claim: str = "email"
+    oidc_role_claim: str = "roles"
+
 
 @lru_cache
 def get_settings() -> Settings:

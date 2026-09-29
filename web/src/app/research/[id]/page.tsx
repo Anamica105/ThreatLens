@@ -37,6 +37,7 @@ const EXPORTS = [
   { id: "email", label: "Email (HTML)", icon: <Mail /> },
   { id: "pptx", label: "2-slide PPT", icon: <Presentation /> },
   { id: "json", label: "JSON", icon: <FileJson /> },
+  { id: "stix", label: "STIX 2.1 bundle", icon: <FileJson /> },
   { id: "iocs_csv", label: "IoCs CSV", icon: <FileSpreadsheet /> },
   { id: "queries_csv", label: "Queries CSV", icon: <FileSpreadsheet /> },
 ] as const;
@@ -69,6 +70,7 @@ export default function ResearchDetailPage() {
     const p = new URLSearchParams(params.toString());
     p.set("tab", t);
     p.delete("done");
+    if (t !== "report") { p.delete("thread"); p.delete("c"); }
     router.replace(`${pathname}?${p.toString()}`, { scroll: false });
   }, [params, pathname, router]);
 

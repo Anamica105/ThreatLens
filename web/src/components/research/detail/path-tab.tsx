@@ -1,7 +1,6 @@
 "use client";
 
 import { ArrowRight, Download, ExternalLink, List, Map as MapIcon, Maximize, Minus, Plus, Search, X } from "lucide-react";
-import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CLASSIFICATION, CLASSIFICATION_NAMES, CREDIBILITY, DATA_SOURCES, IOC_TYPE_LABEL, PATH_STAGES, PROVENANCE, QUERY_STATUS, QUERY_TYPE, RELIABILITY, SOURCE_ORIGIN,
@@ -16,7 +15,7 @@ import { Drawer, Menu, Tooltip } from "../../ui/overlay";
 import { IocValue } from "../ioc-value";
 import { SourceChips, sourceIndex } from "../provenance";
 import { QueryBlock } from "../query-block";
-import { Quote, SourceRefs, type DetailProps } from "./common";
+import { Quote, SourceRefs, WsLink, type DetailProps } from "./common";
 import {
   buildPathModel, COL_W, COLLAPSE_AT, layoutPath, lineage, orderColumns, W,
   type NodeData, type PathLayout, type PathModel, type Placed, type PNode,
@@ -294,7 +293,7 @@ export function PathTab({ d, canEdit }: DetailProps) {
           suffix={q ? `${matches.length ? (matchIdx % matches.length) + 1 : 0}/${matches.length}` : undefined} />
         {(selected || kbd) && <Button size="sm" variant="tertiary" icon={<X />} onClick={() => { setSelected(null); setKbd(false); }}>Clear highlight</Button>}
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          <Tooltip content="List view (text equivalent)"><Link href="?tab=list" className="inline-flex h-7 items-center gap-1.5 rounded-sm px-2 text-[13px] font-semibold text-accent-text hover:bg-accent-soft"><List className="size-4" />List view</Link></Tooltip>
+          <Tooltip content="List view (text equivalent)"><WsLink href="?tab=list" className="inline-flex h-7 items-center gap-1.5 rounded-sm px-2 text-[13px] font-semibold text-accent-text hover:bg-accent-soft"><List className="size-4" />List view</WsLink></Tooltip>
           <Button size="sm" variant={minimap ? "secondary" : "tertiary"} icon={<MapIcon />} onClick={() => setMinimap(!minimap)} aria-pressed={minimap}>Minimap</Button>
           <Menu width={200} items={[{ label: "Export PNG", icon: <Download />, onSelect: () => exportImg("png") }, { label: "Export SVG", icon: <Download />, onSelect: () => exportImg("svg") }]}
             trigger={(p) => <Button {...p} size="sm" icon={<Download />}>Export</Button>} />
@@ -755,7 +754,7 @@ function PathDetails({ n, d, rec, model, canEdit, go }: { n: PNode; d: DetailPro
           {iocs.length ? (
             <ul className="space-y-1.5">
               {iocs.slice(0, 12).map((i) => <li key={i.type + i.value} className="min-w-0"><IocValue type={i.type} value={i.value} verdict={i.verdict} compact /> <span className="text-caption text-fg-muted">{IOC_TYPE_LABEL[i.type] ?? i.type}</span></li>)}
-              {iocs.length > 12 && <li><Link href="?tab=iocs" className="prose-link text-body-sm">All {iocs.length} IoCs from this source</Link></li>}
+              {iocs.length > 12 && <li><WsLink href="?tab=iocs" className="prose-link text-body-sm">All {iocs.length} IoCs from this source</WsLink></li>}
             </ul>
           ) : <p className="text-body-sm text-fg-muted">No indicators taken from this source.</p>}
         </Section>

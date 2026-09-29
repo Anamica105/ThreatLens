@@ -1,6 +1,6 @@
 "use client";
 
-import { Archive, ArrowDown, ArrowUp, ArrowUpDown, Download, FileSearch, Plus, SearchX } from "lucide-react";
+import { Archive, ArrowDown, ArrowUp, ArrowUpDown, Download, FileSearch, Mail, Plus, SearchX } from "lucide-react";
 import { ChipList } from "@/components/chip-list";
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -60,6 +60,14 @@ export default function ResearchLibrary() {
     sort, page, page_size: pageSize,
   })}`;
   const { data, error, loading, reload } = useApi<List>(apiUrl);
+  // Actor and industry options come from the research in scope (one light request, independent of the other filters).
+  const { data: facetData } = useApi<List>(`/api/research${qs({ ws, page_size: 1000 })}`);
+  const facets = useMemo(() => {
+    const rows = facetData?.items ?? [];
+    const sorted = (xs: string[]) => Array.from(new Set(xs.filter(Boolean))).sort((a, b) => a.localeCompare(b));
+    return { actors: sorted(rows.flatMap((r) => r.actors)), industries: sorted(rows.flatMap((r) => r.industries)) };
+  }, [facetData]);
+  const withCurrent = (xs: string[], cur: string | null) => (cur && !xs.some((x) => x.toLowerCase() === cur.toLowerCase()) ? [cur, ...xs] : xs);
 
   // Filters with a popover in the filter bar; their chips are derived by LibraryLayout.
   const one = (k: string) => (params.get(k) ? [params.get(k)!] : []);
@@ -68,6 +76,8 @@ export default function ResearchLibrary() {
     { key: "severity", label: "Severity", values: get("severity"), onChange: (v) => setParam("severity", v), options: SEVERITIES.map((s) => ({ value: s, label: SEVERITY[s].label, dot: SEVERITY[s].solid })) },
     { key: "classification", label: "Classification", values: get("classification"), onChange: (v) => setParam("classification", v), options: CLASSIFICATION_FILTERS.map((c) => ({ value: c, label: CLASSIFICATION_NAMES[c], dot: CLASSIFICATION[c].color })) },
     { key: "result", label: "Result", values: get("result"), onChange: (v) => setParam("result", v), options: Object.entries(RESULT_STATUS).map(([k, v]) => ({ value: k, label: v.label })) },
+    { key: "actor", label: "Actor", single: true, values: one("actor"), onChange: (v) => setParam("actor", v[0] ?? null), options: withCurrent(facets.actors, params.get("actor")).map((a) => ({ value: a, label: a })) },
+    { key: "industry", label: "Industry", single: true, values: one("industry"), onChange: (v) => setParam("industry", v[0] ?? null), options: withCurrent(facets.industries, params.get("industry")).map((i) => ({ value: i, label: i })) },
     { key: "platform", label: "Platform", single: true, values: one("platform"), onChange: (v) => setParam("platform", v[0] ?? null), options: (meta?.platforms ?? []).map((p) => ({ value: p.id, label: p.name })) },
     { key: "author", label: "Author", single: true, values: one("author"), onChange: (v) => setParam("author", v[0] ?? null), options: (meta?.users ?? []).map((u) => ({ value: u.id, label: u.name })) },
   ];
@@ -75,7 +85,7 @@ export default function ResearchLibrary() {
   // URL-only filters (reached from chips, dashboard tiles and entity pages) show as chips only.
   const chips = useMemo(() => {
     const out: ActiveChip[] = [];
-    for (const [k, label] of [["actor", "Actor"], ["industry", "Industry"], ["cve", "CVE"], ["technique", "Technique"], ["tactic", "Tactic"]] as const) {
+    for (const [k, label] of [["cve", "CVE"], ["technique", "Technique"], ["tactic", "Tactic"]] as const) {
       const v = params.get(k);
       if (v) out.push({ key: k, label: `${label}: ${k === "tactic" ? meta?.tactics.find((t) => t.id === v)?.name ?? v : v}`, onRemove: () => setParam(k, null) });
     }
@@ -115,7 +125,10 @@ export default function ResearchLibrary() {
   return (
     <Page>
       <PageHeader title="Research" description={activeWorkspace ? `Research in scope for ${activeWorkspace.name}` : "All research across workspaces"}
-        actions={<ButtonLink href={wsHref("/research/new")} variant="primary" icon={<Plus />}>Start research</ButtonLink>} />
+        actions={<>
+          <ButtonLink href={wsHref("/research/intake")} icon={<Mail />}>Import email</ButtonLink>
+          <ButtonLink href={wsHref("/research/new")} variant="primary" icon={<Plus />}>Start research</ButtonLink>
+        </>} />
 
       <LibraryLayout storageKey="research" search={q} onSearch={(v) => { setQ(v); setPage(1); }} searchLabel="Search title, summary, IoCs, CVEs"
         view={view} onView={setView} sort={sort} onSort={(v) => setParam("sort", v)} sortOptions={SORTS}

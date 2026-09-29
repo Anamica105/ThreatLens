@@ -12,5 +12,12 @@ openpyxl>=3.1
 jinja2>=3.1
 playwright>=1.45
 python-multipart>=0.0.9
+cryptography>=42
+# Sigma translation (spec 8 step 3). QRadar AQL backend omitted: it pins pysigma<0.12 and regex<2024 (breaks dateparser).
+pysigma==1.5.1
+pysigma-backend-splunk==2.1.0
+pysigma-backend-kusto==1.0.1
+pysigma-backend-elasticsearch==2.1.1
+stix2>=3.0
 # Optional, for PostgreSQL deployments:
 # psycopg[binary]>=3.2

@@ -7,21 +7,26 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy import String, case, cast, column, func, literal_column, or_, text
 from sqlalchemy.orm import Session
 
-from .. import attack, detection, llm, osint
+from .. import attack, detection, llm, osint, secrets
 from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user, iso, user_dict, workspace_dict
 from ..exports import render
 from ..exports.context import SEV, RESULT, fmt_utc
 from ..ioc import detect_type, refang
+from ..migrate import research_fts_available
 from ..models import Actor, ExportLog, Ioc, MalwareTool, Query, Research, Result, Setting, User, Vulnerability, Workspace
 from ..records import slug
 from ..sources import VENDORS
 from .dashboard import _aware, dashboard, period_bounds
 
 router = APIRouter(prefix="/api", tags=["misc"])
+
+# Until osint.get_keys calls secrets.get_osint_keys itself, route it through decryption.
+secrets.install()
 
 
 # ------------------------------------------------------------------ meta & users
@@ -76,13 +81,29 @@ class WorkspaceIn(BaseModel):
     default_tlp: str = "AMBER"
 
 
+def workspace_research_counts(db: Session) -> dict[str, int]:
+    """Research count per workspace id in one aggregate query (workspace_ids is a JSON array on research)."""
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        rows = db.execute(text("SELECT j.value, COUNT(DISTINCT r.id) FROM research r, json_each(r.workspace_ids) j "
+                               "GROUP BY j.value")).all()
+        return {k: n for k, n in rows}
+    if dialect == "postgresql":
+        rows = db.execute(text("SELECT j.value, COUNT(DISTINCT r.id) FROM research r, "
+                               "json_array_elements_text(r.workspace_ids::json) AS j(value) GROUP BY j.value")).all()
+        return {k: n for k, n in rows}
+    out: dict[str, int] = {}
+    for (ids,) in db.query(Research.workspace_ids).all():
+        for w in set(ids or []):
+            out[w] = out.get(w, 0) + 1
+    return out
+
+
 @router.get("/workspaces")
 def list_workspaces(db: Session = Depends(get_db)):
-    out = []
-    for w in db.query(Workspace).order_by(Workspace.name).all():
-        n = sum(1 for r in db.query(Research).all() if w.id in (r.workspace_ids or []))
-        out.append({**workspace_dict(w), "research_count": n})
-    return out
+    counts = workspace_research_counts(db)
+    return [{**workspace_dict(w), "research_count": counts.get(w.id, 0)}
+            for w in db.query(Workspace).order_by(Workspace.name).all()]
 
 
 @router.get("/workspaces/{wid}")
@@ -147,11 +168,17 @@ async def upload_logo(wid: str, file: UploadFile = File(...), db: Session = Depe
 
 @router.get("/settings/osint-keys")
 def get_keys(db: Session = Depends(get_db)):
-    keys = osint.get_keys(db)
-    stored = (db.get(Setting, "osint_keys") or Setting(value={})).value or {}
-    return [{"id": p["id"], "name": p["name"], "types": p["types"], "configured": bool(keys.get(p["id"])),
-             "source": "settings" if stored.get(p["id"]) else ("environment" if keys.get(p["id"]) else None),
-             "hint": ("•••• " + keys[p["id"]][-4:]) if keys.get(p["id"]) else ""} for p in osint.PROVIDERS]
+    """Never returns a key: only whether one is configured, where it comes from and a masked hint (last 4 chars)."""
+    s = get_settings()
+    stored = secrets.stored_osint_keys(db)
+    out = []
+    for p in osint.PROVIDERS:
+        env = getattr(s, p["env"], "")
+        key = stored.get(p["id"]) or env
+        out.append({"id": p["id"], "name": p["name"], "types": p["types"], "configured": bool(key),
+                    "source": "settings" if stored.get(p["id"]) else ("environment" if env else None),
+                    "hint": secrets.mask(key), "encrypted": bool(stored.get(p["id"]))})
+    return out
 
 
 class KeysIn(BaseModel):
@@ -162,18 +189,7 @@ class KeysIn(BaseModel):
 def put_keys(body: KeysIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     if user.role not in ("admin", "lead"):
         raise HTTPException(403, "Only leads and admins can change OSINT keys")
-    row = db.get(Setting, "osint_keys") or Setting(key="osint_keys", value={})
-    val = dict(row.value or {})
-    for k, v in body.keys.items():
-        if k not in {p["id"] for p in osint.PROVIDERS}:
-            continue
-        if v:
-            val[k] = v.strip()
-        else:
-            val.pop(k, None)
-    row.value = val
-    db.merge(row)
-    db.commit()
+    secrets.set_osint_keys(db, body.keys)
     return get_keys(db)
 
 
@@ -196,6 +212,41 @@ def attack_sync(db: Session = Depends(get_db), user: User = Depends(current_user
 
 # ------------------------------------------------------------------ global search
 
+def _like(ql: str) -> str:
+    """Substring LIKE pattern with LIKE wildcards in the user's text escaped (escape char: backslash)."""
+    esc = ql.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _search_research(db: Session, q: str, ql: str, limit: int) -> list[dict]:
+    """Research hits filtered in SQL. Exact id first, then id prefix, then most recently updated. On PostgreSQL a
+    full-text match (to_tsvector over search_text) is used; substring LIKE covers partial words and other dialects."""
+    like = _like(ql)
+    base = db.query(Research.id, Research.title, Research.status).filter(Research.status != "archived")
+    exact = case((Research.id == q.upper(), 0), (func.lower(Research.id).like(like[1:], escape="\\"), 1), else_=2)
+    if db.get_bind().dialect.name == "postgresql":
+        tsq = func.plainto_tsquery("simple", ql)
+        tsv = func.to_tsvector("simple", Research.search_text)
+        rows = (base.filter(or_(tsv.op("@@")(tsq), func.lower(Research.id).like(like, escape="\\")))
+                .order_by(exact, func.ts_rank(tsv, tsq).desc(), Research.updated_at.desc()).limit(limit).all())
+        if len(rows) < limit:
+            seen = {r.id for r in rows}
+            more = (base.filter(or_(Research.search_text.like(like, escape="\\"), func.lower(Research.id).like(like, escape="\\")))
+                    .order_by(exact, Research.updated_at.desc()).limit(limit).all())
+            rows += [r for r in more if r.id not in seen][: limit - len(rows)]
+    elif len(ql) >= 3 and research_fts_available(db):
+        # Trigram FTS5 phrase = case-insensitive substring match over id + search_text, served from the index.
+        phrase = '"' + ql.replace('"', '""') + '"'
+        hits = text("SELECT rowid FROM research_fts WHERE research_fts MATCH :p").bindparams(p=phrase).columns(column("rowid"))
+        rows = (base.filter(literal_column("research.rowid").in_(hits))
+                .order_by(exact, Research.updated_at.desc()).limit(limit).all())
+    else:
+        rows = (base.filter(or_(Research.search_text.like(like, escape="\\"), func.lower(Research.id).like(like, escape="\\")))
+                .order_by(exact, Research.updated_at.desc()).limit(limit).all())
+    return [{"id": r.id, "title": r.title, "sub": f"{r.id} · {r.status.replace('_', ' ')}", "href": f"/research/{r.id}"}
+            for r in rows]
+
+
 @router.get("/search")
 def search(q: str, db: Session = Depends(get_db)):
     q = q.strip()
@@ -208,7 +259,7 @@ def search(q: str, db: Session = Depends(get_db)):
         if db.get(Vulnerability, q.upper()):
             jump = {"kind": "cve", "id": q.upper(), "href": f"/research?cve={q.upper()}"}
     elif t in ("ipv4", "domain", "url", "sha256", "sha1", "md5"):
-        hit = db.query(Ioc).filter(Ioc.value.ilike(ql)).first()
+        hit = db.query(Ioc).filter(Ioc.value == refang(q)).first() or db.query(Ioc).filter(Ioc.value.ilike(ql)).first()
         if hit:
             jump = {"kind": "ioc", "id": hit.id, "href": f"/library/iocs/{hit.id}"}
     if re.fullmatch(r"tr-\d{4}-\d{4}", ql):
@@ -216,17 +267,22 @@ def search(q: str, db: Session = Depends(get_db)):
         if r:
             jump = {"kind": "research", "id": r.id, "href": f"/research/{r.id}"}
 
-    research = [{"id": r.id, "title": r.title, "sub": f"{r.id} · {r.status.replace('_', ' ')}", "href": f"/research/{r.id}"}
-                for r in db.query(Research).filter(Research.status != "archived").all()
-                if ql in (r.search_text or "") or ql in r.id.lower()][:6]
+    research = _search_research(db, q, ql, 6)
+    like = _like(ql)
     actors = [{"id": a.id, "title": a.name, "sub": ", ".join(a.aliases or [])[:60], "href": f"/library/actors/{a.id}"}
-              for a in db.query(Actor).all() if ql in (a.name + " " + " ".join(a.aliases or [])).lower()][:5]
+              for a in db.query(Actor).filter(or_(func.lower(Actor.name).like(like, escape="\\"),
+                                                   func.lower(cast(Actor.aliases, String)).like(like, escape="\\")))
+              .order_by(case((func.lower(Actor.name) == ql, 0), else_=1), Actor.name).limit(5).all()]
     malware = [{"id": m.id, "title": m.name, "sub": m.type, "href": f"/library/malware/{m.id}"}
-               for m in db.query(MalwareTool).all() if ql in m.name.lower()][:5]
+               for m in db.query(MalwareTool).filter(func.lower(MalwareTool.name).like(like, escape="\\"))
+               .order_by(case((func.lower(MalwareTool.name) == ql, 0), else_=1), MalwareTool.name).limit(5).all()]
     iocs = [{"id": i.id, "title": i.value, "sub": f"{i.type} · {i.verdict}", "href": f"/library/iocs/{i.id}", "ioc_type": i.type}
-            for i in db.query(Ioc).filter(Ioc.value.ilike(f"%{ql}%")).limit(5).all()]
+            for i in db.query(Ioc).filter(Ioc.value.ilike(like, escape="\\"))
+            .order_by(case((func.lower(Ioc.value) == ql, 0), else_=1), Ioc.id.desc()).limit(5).all()]
     queries = [{"id": x.id, "title": x.title, "sub": f"{x.id} · {x.platform}", "href": f"/library/queries/{x.id}"}
-               for x in db.query(Query).all() if ql in (x.title + " " + x.id).lower()][:5]
+               for x in db.query(Query).filter(or_(func.lower(Query.title).like(like, escape="\\"),
+                                                   func.lower(Query.id).like(like, escape="\\")))
+               .order_by(case((func.lower(Query.id) == ql, 0), else_=1), Query.id).limit(5).all()]
     groups = [g for g in [
         {"label": "Research", "items": research}, {"label": "Threat actors", "items": actors},
         {"label": "Malware & tools", "items": malware}, {"label": "IoCs", "items": iocs}, {"label": "Queries", "items": queries},

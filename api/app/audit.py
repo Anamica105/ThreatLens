@@ -19,11 +19,12 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import get_settings
 from .db import SessionLocal, get_db
-from .deps import current_user, iso, user_dict
+from .deps import current_user, iso, resolve_user, user_dict
 from .models import AuditEvent, User
 
 log = logging.getLogger(__name__)
@@ -133,8 +134,18 @@ class ViewAuditMiddleware:
 
         await self.app(scope, receive, _send)
         if status.get("code") == 200:
-            user = next((v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"x-user"), None)
+            peer = (scope.get("client") or (None,))[0]
+            user = await run_in_threadpool(_caller_id, Headers(scope=scope), peer)
             await run_in_threadpool(record_view, user, hit[0], hit[1], scope.get("path", ""))
+
+
+def _caller_id(headers: Headers, peer: str | None) -> str | None:
+    """The caller's user id under the configured AUTH_MODE (same rule as deps.current_user)."""
+    with SessionLocal() as db:
+        try:
+            return resolve_user(db, headers, peer).id
+        except HTTPException:
+            return None
 
 
 # ------------------------------------------------------------------ API

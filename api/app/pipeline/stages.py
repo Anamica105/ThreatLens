@@ -635,8 +635,9 @@ def stage_queries(ctx: Ctx):
 
 
 def _query_row(db, type_, title, platform, body, group, source_ids, provenance, opp=None, techniques=(), fp="",
-               data_sources=(), origin="generated", log_sources=None, sigma_ref=None) -> dict:
-    """One query dict as stored in record.hunts.queries (allocates the next Q- id)."""
+               data_sources=(), origin="generated", log_sources=None, sigma_ref=None, engine=None) -> dict:
+    """One query dict as stored in record.hunts.queries (allocates the next Q- id). `engine` records what produced the
+    body: "pysigma:<backend>" | "builtin" | "llm" (defaults to builtin for generated queries, None for vendor ones)."""
     issues = detection.lint(platform, body) if origin == "generated" else []
     return {
         "id": next_id(db, "query", "Q"), "group": group, "type": type_, "title": title, "platform": platform, "body": body,
@@ -644,6 +645,7 @@ def _query_row(db, type_, title, platform, body, group, source_ids, provenance, 
         "log_sources": log_sources if log_sources is not None else [detection.LOG_SOURCES.get(c, {}).get(platform, c) for c in data_sources],
         "status": "reference" if origin == "reference" else ("syntax_checked" if not issues else "generated"),
         "lint": issues, "origin": origin, "sigma_ref": sigma_ref,
+        "engine": engine if engine is not None else (None if origin == "reference" else detection.ENGINE_BUILTIN),
         "source_ids": list(source_ids), "provenance": provenance,
     }
 
@@ -700,9 +702,10 @@ def build_ioc_queries(db, platforms: list[str], days: int, ioc_values: dict, typ
                 group, sids, "derived", data_sources=[cat]))
             sig_id = rows[-1]["id"]
         for p in native:
-            body = detection.ioc_query(p, cat, vs, days)
-            if body:
-                rows.append(_query_row(db, "ioc", title, p, body, group, sids, "derived", data_sources=[cat], sigma_ref=sig_id))
+            r = detection.render_ioc_query(p, cat, vs, days)
+            if r:
+                rows.append(_query_row(db, "ioc", title, p, r["body"], group, sids, "derived", data_sources=[cat], sigma_ref=sig_id,
+                                       log_sources=r.get("log_sources"), engine=r["engine"]))
         for q in rows:
             q["ioc_values"] = vs
         out += rows
@@ -800,6 +803,56 @@ def regenerate_ioc_queries(db, rec: dict, platforms: list[str] | None = None, da
     return changes
 
 
+_AUTO_STATUSES = (None, "", "generated", "syntax_checked")
+
+
+def regenerate_detection_queries(rec: dict, days: int | None = None, force: bool = False) -> list[str]:
+    """Re-render the record's behavioural queries (DET-* from detection opportunities, TTP-* generic hunts) with the
+    current engines (pySigma where available, built-in otherwise), in place: query ids, groups and sigma_refs are kept.
+
+    Only queries still at an automatic status (generated / syntax_checked) are touched, so analyst-reviewed or deployed
+    queries never change under the analyst; LLM-written variants are kept unless `force`, in which case a
+    deterministic engine replaces them where it can. Sigma rows are re-rendered too (UUID ids, escaping).
+    IoC groups are handled by regenerate_ioc_queries(force=True). Mutates `rec`; returns the ids of changed queries."""
+    hunts = rec.get("hunts") or {}
+    days = int(days or hunts.get("lookback_days") or 30)
+    opps = {o.get("id"): o for o in rec.get("detection_opportunities", []) or [] if o.get("spec")}
+    templates = {t["title"]: (tid, t) for tid, ts in TECHNIQUE_OPPORTUNITIES.items() for t in ts}
+    changed: list[str] = []
+    sigma_by_group: dict[str, str] = {}
+    queries = hunts.get("queries") or []
+    # Sigma rows first so the per-platform rows translate from the refreshed rule.
+    for q in sorted(queries, key=lambda q: q.get("platform") != "sigma"):
+        if q.get("origin", "generated") != "generated" or q.get("type") in ("ioc", "vuln"):
+            continue
+        if q.get("opportunity_id") in opps:
+            o = opps[q["opportunity_id"]]
+            spec, title, rule_id = o["spec"], o.get("title", q.get("title", "")), o["id"]
+            techs, fp, level = o.get("techniques", []), o.get("fp_notes", ""), "high"
+        elif str(q.get("group", "")).startswith("TTP-") and q.get("title") in templates:
+            tid, t = templates[q["title"]]
+            spec, title, rule_id, techs, fp, level = t["spec"], t["title"], q["group"], [tid], t["fp_notes"], "medium"
+        else:
+            continue
+        sigma = sigma_by_group.get(q.get("group")) or detection.to_sigma(title, spec, rule_id, techs, fp, level=level)
+        sigma_by_group[q.get("group")] = sigma
+        if q.get("status") not in _AUTO_STATUSES or (q.get("engine") == detection.ENGINE_LLM and not force):
+            continue
+        if q.get("platform") == "sigma":
+            new = {"body": sigma, "engine": detection.ENGINE_BUILTIN}
+        else:
+            new = detection.render_query(spec, q.get("platform", ""), days, title, sigma)
+        if not new or (new["body"] == q.get("body") and new["engine"] == q.get("engine")):
+            continue
+        q["body"], q["engine"] = new["body"], new["engine"]
+        if new.get("log_sources"):
+            q["log_sources"] = new["log_sources"]
+        q["lint"] = detection.lint(q["platform"], q["body"], q.get("techniques"))
+        q["status"] = "generated" if q["lint"] else "syntax_checked"
+        changed.append(q.get("id"))
+    return changed
+
+
 def pipeline_hunt_filter(db, research_id: str | None, artifacts: dict) -> tuple[set[str], str]:
     """Keys (records.ioc_key) of indicators to leave out of retro-hunts when query generation runs.
 
@@ -849,9 +902,9 @@ def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_
     missing: list[dict] = []
 
     def add(type_, title, platform, body, group, source_ids, provenance, opp=None, techniques=(), fp="", data_sources=(),
-            origin="generated", log_sources=None, sigma_ref=None):
+            origin="generated", log_sources=None, sigma_ref=None, engine=None):
         queries.append(_query_row(db, type_, title, platform, body, group, source_ids, provenance, opp, techniques, fp,
-                                  data_sources, origin, log_sources, sigma_ref))
+                                  data_sources, origin, log_sources, sigma_ref, engine))
 
     # IoA / TTP queries from detection opportunities (Sigma first, then per platform). One group per opportunity.
     for o in opps:
@@ -862,12 +915,12 @@ def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_
             o["data_sources"])
         sig_id = queries[-1]["id"]
         for p in native:
-            body = detection.translate(o["spec"], p, days, o["title"])
-            if body is None:
+            r = detection.render_query(o["spec"], p, days, o["title"], sigma)
+            if r is None:
                 missing.append({"opportunity": o, "platform": p, "sigma": sigma, "sigma_ref": sig_id, "group": group, "source_ids": sids})
                 continue
-            add(o["type"], o["title"], p, body, group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
-                o["data_sources"], sigma_ref=sig_id)
+            add(o["type"], o["title"], p, r["body"], group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
+                o["data_sources"], sigma_ref=sig_id, log_sources=r.get("log_sources"), engine=r["engine"])
 
     if missing and llm_fill:
         by_pair = {(m["opportunity"]["id"], m["platform"]): m for m in missing}
@@ -876,7 +929,8 @@ def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_
             if m:
                 o = m["opportunity"]
                 add(o["type"], o["title"], q["platform"], q["query"], m["group"], m["source_ids"], "derived", o["id"],
-                    o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=m["sigma_ref"])
+                    o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=m["sigma_ref"],
+                    engine=detection.ENGINE_LLM)
     elif missing:
         gaps = sorted({f"{detection.PLATFORM_BY_ID[m['platform']]['short']} ({detection.CATEGORIES[m['opportunity']['spec']['category']]})" for m in missing})
         logf(f"No native telemetry for: {', '.join(gaps)}", "warn")
@@ -914,10 +968,10 @@ def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_
                 add("ttp", t["title"], "sigma", sigma, group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]])
                 sig_id = queries[-1]["id"]
                 for p in native:
-                    body = detection.translate(t["spec"], p, days, t["title"])
-                    if body:
-                        add("ttp", t["title"], p, body, group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]],
-                            sigma_ref=sig_id)
+                    r = detection.render_query(t["spec"], p, days, t["title"], sigma)
+                    if r:
+                        add("ttp", t["title"], p, r["body"], group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]],
+                            sigma_ref=sig_id, log_sources=r.get("log_sources"), engine=r["engine"])
 
     # Vendor-supplied reference queries: each its own group, kept verbatim (deduplicated by body).
     seen_bodies: set[str] = set()

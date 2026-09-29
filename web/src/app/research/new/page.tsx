@@ -1,26 +1,47 @@
 "use client";
 
 import clsx from "clsx";
-import { Check, Info } from "lucide-react";
+import { Check, Info, Mail } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp, useWsHref } from "@/components/providers";
 import { Chip } from "@/components/ui/badges";
-import { Button } from "@/components/ui/button";
+import { Button, ButtonLink } from "@/components/ui/button";
 import { Alert, useToast } from "@/components/ui/feedback";
 import { ChipInput, Field, MultiSelect, Segmented, Select, Textarea, Toggle } from "@/components/ui/forms";
 import { Page, PageHeader } from "@/components/ui/layout";
 import { Dialog } from "@/components/ui/overlay";
 import { post } from "@/lib/api";
 import { CLASSIFICATION, TLPS } from "@/lib/constants";
-import { useDebounced } from "@/lib/hooks";
+import { useApi, useDebounced } from "@/lib/hooks";
 
 const DEPTHS = [
   { value: "quick", label: "Quick (5)" },
   { value: "standard", label: "Standard (10)" },
   { value: "deep", label: "Deep (15+)" },
 ] as const;
+
+/** Fallback names when the malware library is empty or unreachable. */
+const KNOWN_MALWARE = ["Cobalt Strike", "Mimikatz", "PsExec", "Impacket", "Sliver", "Brute Ratel", "Metasploit", "LockBit", "BlackCat", "ALPHV", "Akira",
+  "Black Basta", "Qakbot", "Emotet", "IcedID", "Rhysida", "Conti", "Warlock", "AsyncRAT", "Remcos", "njRAT", "PlugX", "ShadowPad", "Rclone", "SystemBC", "China Chopper"];
+const FILE_EXT = /\.(exe|dll|aspx?|jsp|php|js|ps1|bat|cmd|vbs|zip|rar|7z|txt|log|html?|xml|json|config|sys|msi|lnk|iso|img|docx?|xlsx?|pdf)$/i;
+const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Undo common defanging: 1.2.3[.]4, example(.)com, hxxp:// */
+const refangText = (s: string) => s.replace(/\[\.\]|\(\.\)|\{\.\}/g, ".").replace(/hxxp/gi, "http");
+
+/** Malware/tool names (from the malware library, else a short known list) and IoCs (hash, IPv4, domain) in the seed. */
+function detectIntel(seed: string, malwareNames: string[]) {
+  const text = refangText(seed);
+  const noUrls = text.replace(/https?:\/\/[^\s<>"')\]]+/g, " ");
+  const malware = Array.from(new Set([...malwareNames, ...KNOWN_MALWARE].filter((n) => n.length >= 4)))
+    .filter((n) => new RegExp(`(^|[^\\w])${esc(n)}(?![\\w])`, "i").test(text));
+  const hashes = Array.from(new Set((noUrls.match(/\b(?:[a-f0-9]{64}|[a-f0-9]{40}|[a-f0-9]{32})\b/gi) ?? []).map((h) => h.toLowerCase())));
+  const ips = Array.from(new Set(noUrls.match(/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g) ?? []));
+  const domains = Array.from(new Set((noUrls.match(/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b/gi) ?? [])
+    .map((d) => d.toLowerCase()).filter((d) => !FILE_EXT.test(d) && !malware.some((m) => m.toLowerCase() === d))));
+  return { malware, iocs: [...hashes.map((v) => ({ type: "hash", value: v })), ...ips.map((v) => ({ type: "ip", value: v })), ...domains.map((v) => ({ type: "domain", value: v }))] };
+}
 
 function detect(seed: string) {
   const cves = Array.from(new Set((seed.match(/CVE-\d{4}-\d{4,7}/gi) ?? []).map((c) => c.toUpperCase())));
@@ -33,6 +54,7 @@ function detect(seed: string) {
 
 export default function NewResearch() {
   const { workspaces, activeWorkspace, meta } = useApp();
+  const { data: malwareLib } = useApi<{ items: { name: string }[] }>("/api/library/malware");
   const router = useRouter();
   const wsHref = useWsHref();
   const toast = useToast();
@@ -70,9 +92,14 @@ export default function NewResearch() {
 
   const dseed = useDebounced(seed, 300);
   const found = useMemo(() => detect(dseed), [dseed]);
+  const intel = useMemo(() => detectIntel(dseed, (malwareLib?.items ?? []).map((m) => m.name)), [dseed, malwareLib]);
+  const shortIoc = (v: string) => (v.length > 20 ? `${v.slice(0, 10)}…${v.slice(-6)}` : v);
   const chips = [
     ...found.cves.map((c) => ({ key: c, label: c, dot: CLASSIFICATION.cve.color })),
     ...found.actors.map((a) => ({ key: a, label: a, dot: CLASSIFICATION.actor.color })),
+    ...intel.malware.map((m) => ({ key: `mal:${m}`, label: m, dot: CLASSIFICATION.intel.color })),
+    ...intel.iocs.slice(0, 6).map((i) => ({ key: `ioc:${i.value}`, label: `${i.type === "hash" ? "Hash" : i.type === "ip" ? "IP" : "Domain"} ${shortIoc(i.value)}`, dot: CLASSIFICATION.detection.color })),
+    ...(intel.iocs.length > 6 ? [{ key: "ioc:more", label: `+${intel.iocs.length - 6} IoCs`, dot: CLASSIFICATION.detection.color }] : []),
     ...(found.urls.length ? [{ key: "urls", label: `${found.urls.length} URL${found.urls.length > 1 ? "s" : ""}`, dot: CLASSIFICATION.intel.color }] : []),
   ].filter((c) => !removed.includes(c.key));
 
@@ -124,7 +151,8 @@ export default function NewResearch() {
   return (
     <Page className="pb-28">
       <PageHeader crumbs={[{ label: "Research", href: "/research" }, { label: "New run" }]} title="Start research"
-        description="Turn a threat headline into a configured run. The pipeline collects sources, reads them and builds a draft report." />
+        description="Turn a threat headline into a configured run. The pipeline collects sources, reads them and builds a draft report."
+        actions={<ButtonLink href={wsHref("/research/intake")} icon={<Mail />}>Import email</ButtonLink>} />
       <div className="max-w-form space-y-8">
         {Object.keys(errors).length > 0 && (
           <div ref={summaryRef} tabIndex={-1}>

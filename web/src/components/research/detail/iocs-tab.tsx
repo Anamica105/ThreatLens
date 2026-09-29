@@ -1,6 +1,7 @@
 "use client";
 
 import { Ban, CircleSlash, Copy, Download, EyeOff, Fingerprint, MoreHorizontal, RotateCcw, Search, ShieldCheck, ShieldX } from "lucide-react";
+import Link from "next/link";
 import { useMemo, useState } from "react";
 import { download, patch } from "@/lib/api";
 import { IOC_TYPE_LABEL, VERDICT } from "@/lib/constants";
@@ -8,6 +9,7 @@ import { defang, refang, relative, utc } from "@/lib/format";
 import { copyText } from "@/lib/hooks";
 import type { IocRow, Verdict } from "@/lib/types";
 import { FilterButton } from "../../filters";
+import { useWsHref } from "../../providers";
 import { Badge, VerdictBadge } from "../../ui/badges";
 import { Button } from "../../ui/button";
 import { EmptyState, useToast } from "../../ui/feedback";
@@ -80,6 +82,7 @@ export function IocsTab({ d, ws, reload, canEdit }: DetailProps) {
   const iocs = rec.iocs as unknown as ReviewedIoc[];
   const includeExpired = !!(rec as unknown as { ioc_review?: { include_expired?: boolean } }).ioc_review?.include_expired;
   const toast = useToast();
+  const wsHref = useWsHref();
   const sources = useMemo(() => Object.fromEntries(rec.sources.map((s) => [s.id, s])), [rec.sources]);
   const [q, setQ] = useState("");
   const [types, setTypes] = useState<string[]>([]);
@@ -136,7 +139,7 @@ export function IocsTab({ d, ws, reload, canEdit }: DetailProps) {
     send(items.map((i) => ({ type: i.type, value: i.value, restore: true })), {}, `${items.length} indicator${items.length === 1 ? "" : "s"} restored`);
 
   if (!iocs.length)
-    return <EmptyState icon={<Fingerprint />} title="No indicators in these sources" body="This threat is described by behaviour only. See the IoA queries." action={<a href="?tab=hunts" className="prose-link">Open Hunts</a>} />;
+    return <EmptyState icon={<Fingerprint />} title="No indicators in these sources" body="This threat is described by behaviour only. See the IoA queries." action={<Link href={wsHref("?tab=hunts")} className="prose-link">Open Hunts</Link>} />;
 
   const verdictKeys = [...(Object.keys(VERDICT) as Verdict[]), "false_positive"] as AnyVerdict[];
   const cur = open !== null ? rows[open] : null;

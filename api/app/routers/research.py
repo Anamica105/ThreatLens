@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 import copy
+import difflib
+import json
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query as Q
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import String, case, cast, func, or_
 from sqlalchemy.orm import Session
 
 from .. import attack, detection, guardrails, llm
-from ..db import get_db
+from ..db import SessionLocal, get_db
 from ..deps import REVIEW_ROLES, current_user, iso, research_summary, user_dict, workspace_dict
 from ..exports import context as export_ctx
 from ..exports import render
 from ..models import ActivityEvent, ExportLog, Query, Research, ResearchVersion, Result, Run, RunLog, User, Workspace
 from ..pipeline import runner
-from ..records import backfill_provenance, log_activity, new_research_id, save_record, sort_sids, tactic_rail
+from ..records import (backfill_provenance, log_activity, new_research_id, refresh_coverage_gaps, save_record, sort_sids,
+                       tactic_rail)
 
 router = APIRouter(prefix="/api/research", tags=["research"])
 
@@ -36,6 +40,85 @@ def _users(db: Session) -> dict[str, User]:
 
 # ------------------------------------------------------------------ list / search
 
+SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+MAX_PAGE_SIZE = 500
+
+
+def _like_json(col, needle: str):
+    """Portable (SQLite / PostgreSQL) substring test on a JSON column's text: a bounded pre-filter, exact check in Python."""
+    esc = needle.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    return cast(col, String).ilike(f"%{esc}%", escape="!")
+
+
+# Facets of the record JSON used by list filters / the IoC-count sort, cached per research and keyed by
+# (updated_at, version) so a saved edit invalidates it. Reading record JSON is the expensive part of the list at scale
+# (records are ~15-20 KB); with the cache only rows changed since the last request are read. A proper fix is a facet
+# table or indexed columns (models change).
+_FACETS: dict[str, tuple[tuple, dict]] = {}
+_FACETS_LOCK = threading.Lock()
+
+
+def _facet_of(actors, industries, platforms, vulns, mitre, n_iocs) -> dict:
+    return {
+        "actors": {x.lower() for a in actors or [] for x in [a.get("name", "")] + list(a.get("aliases", []))},
+        "industries": {(i.get("industry") or "").lower() for i in industries or []},
+        "platforms": set(platforms or []), "cves": {v.get("cve") for v in vulns or []},
+        "techniques": {m.get("technique_id") for m in mitre or []}, "tactics": {m.get("tactic_id") for m in mitre or []},
+        "iocs": int(n_iocs or 0),
+    }
+
+
+def _facets(db: Session, rows: list[tuple]) -> dict[str, dict]:
+    """rows: (id, updated_at, version) → {id: facets}, loading record fragments only for cache misses."""
+    out, missing = {}, []
+    with _FACETS_LOCK:
+        for rid, upd, ver in rows:
+            hit = _FACETS.get(rid)
+            if hit and hit[0] == (upd, ver):
+                out[rid] = hit[1]
+            else:
+                missing.append(rid)
+    rec = Research.record
+    for i in range(0, len(missing), 500):
+        got = db.query(Research.id, Research.updated_at, Research.version, rec["threat_actors"], rec["industries"],
+                       rec[("hunts", "platforms")], rec["vulnerabilities"], rec["mitre"],
+                       func.json_array_length(rec["iocs"])).filter(Research.id.in_(missing[i:i + 500])).all()
+        with _FACETS_LOCK:
+            for rid, upd, ver, *frag in got:
+                f = _facet_of(*frag)
+                _FACETS[rid] = ((upd, ver), f)
+                out[rid] = f
+    return out
+
+
+_WARMED = False
+
+
+def _warm_facets() -> None:
+    """Fill the facet cache in the background on the first list request, so the first JSON-derived filter is fast too."""
+    global _WARMED
+    if _WARMED:
+        return
+    _WARMED = True
+
+    def run():
+        db = SessionLocal()
+        try:
+            _facets(db, [tuple(x) for x in db.query(Research.id, Research.updated_at, Research.version).all()])
+        except Exception:  # noqa: BLE001 - best effort; requests fill the cache on demand anyway
+            pass
+        finally:
+            db.close()
+    threading.Thread(target=run, name="research-facets", daemon=True).start()
+
+
+def _json_keep(f: dict, actor, industry, platform, cve, technique, tactic) -> bool:
+    """Exact checks for JSON-derived filters (same semantics as before B15)."""
+    return not ((actor and actor.lower() not in f["actors"]) or (industry and industry.lower() not in f["industries"])
+                or (platform and platform not in f["platforms"]) or (cve and cve.upper() not in f["cves"])
+                or (technique and technique.upper() not in f["techniques"]) or (tactic and tactic not in f["tactics"]))
+
+
 @router.get("")
 def list_research(
     db: Session = Depends(get_db), ws: str | None = None, q: str | None = None, status: list[str] = Q(default=[]),
@@ -45,6 +128,11 @@ def list_research(
     cve: str | None = None, technique: str | None = None, tactic: str | None = None,
     sort: str = "-created_at", page: int = 1, page_size: int = 50,
 ):
+    """Filtered, sorted, paginated research list. Column filters, workspace/classification membership, result status and
+    free text run in SQL; filters on record JSON (actor, industry, platform, CVE, technique, tactic) are narrowed in SQL
+    with a text pre-filter and confirmed in Python on the candidates only."""
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
     query = db.query(Research)
     if status:
         query = query.filter(Research.status.in_(status))
@@ -61,53 +149,116 @@ def list_research(
     if q:
         for term in q.lower().split():
             query = query.filter(or_(Research.search_text.contains(term), Research.id.ilike(f"%{term}%")))
-    rows = query.all()
-
-    def keep(r: Research) -> bool:
-        rec = r.record or {}
-        if ws and ws != "all" and ws not in (r.workspace_ids or []):
-            return False
-        if classification and not set(classification) & set(r.classification or []):
-            return False
-        if actor and not any(actor.lower() in [a["name"].lower()] + [x.lower() for x in a.get("aliases", [])] for a in rec.get("threat_actors", [])):
-            return False
-        if industry and not any(industry.lower() == i["industry"].lower() for i in rec.get("industries", [])):
-            return False
-        if platform and platform not in rec.get("hunts", {}).get("platforms", []):
-            return False
-        if cve and cve.upper() not in [v["cve"] for v in rec.get("vulnerabilities", [])]:
-            return False
-        if technique and technique.upper() not in [m["technique_id"] for m in rec.get("mitre", [])]:
-            return False
-        if tactic and tactic not in [m["tactic_id"] for m in rec.get("mitre", [])]:
-            return False
-        return True
-
-    rows = [r for r in rows if keep(r)]
-    results = db.query(Result).filter(Result.research_id.in_([r.id for r in rows])).all() if rows else []
-    by_r: dict[str, list[Result]] = {}
-    for x in results:
-        by_r.setdefault(x.research_id, []).append(x)
-    if result and ws and ws != "all":
-        rows = [r for r in rows if any(x.workspace_id == ws and x.status in result for x in by_r.get(r.id, []))]
-    elif result:
-        rows = [r for r in rows if any(x.status in result for x in by_r.get(r.id, []))]
+    scoped = ws and ws != "all"
+    if scoped:
+        query = query.filter(_like_json(Research.workspace_ids, f'"{ws}"'))
+    if classification:
+        query = query.filter(or_(*[_like_json(Research.classification, f'"{c}"') for c in classification]))
+    if result:
+        sub = db.query(Result.research_id).filter(Result.status.in_(result))
+        if scoped:
+            sub = sub.filter(Result.workspace_id == ws)
+        query = query.filter(Research.id.in_(sub))
+    # JSON-derived filters. Actor names/aliases, CVEs and technique ids are in search_text (lower-cased, rebuilt on every
+    # save), which narrows the candidates in SQL; the exact checks (and industry / platform / tactic) use cached facets.
+    for term in (actor, cve, technique):
+        if term:
+            query = query.filter(Research.search_text.contains(term.lower()))
+    json_filter = any((actor, industry, platform, cve, technique, tactic))
 
     desc = sort.startswith("-")
     key = sort.lstrip("-")
-    sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-    keyf = {
-        "created_at": lambda r: iso(r.created_at) or "",
-        "updated_at": lambda r: iso(r.updated_at) or "",
-        "severity": lambda r: sev_rank.get(r.severity, 0), "id": lambda r: r.id, "title": lambda r: r.title.lower(),
-        "status": lambda r: r.status, "iocs": lambda r: len((r.record or {}).get("iocs", [])),
-    }.get(key, lambda r: iso(r.created_at) or "")
-    rows.sort(key=keyf, reverse=desc)
-    total = len(rows)
-    page_rows = rows[(page - 1) * page_size: page * page_size]
+    sev_expr = case(*[(Research.severity == k, v) for k, v in SEV_RANK.items()], else_=0)
+    col = {"created_at": Research.created_at, "updated_at": Research.updated_at, "severity": sev_expr, "id": Research.id,
+           "title": func.lower(Research.title), "status": Research.status}.get(key, Research.created_at)
+    # Two phases: sort / filter / paginate over narrow (id, updated_at, version) rows, then load only the page's records.
+    ids_q = query.with_entities(Research.id, Research.updated_at, Research.version).order_by(
+        col.desc() if desc else col.asc(), Research.id.desc() if desc else Research.id.asc())
+    if not json_filter and key != "iocs":
+        _warm_facets()
+        total = query.order_by(None).count()
+        page_ids = [x[0] for x in ids_q.offset((page - 1) * page_size).limit(page_size).all()]
+    else:
+        cand = [tuple(x) for x in ids_q.all()]
+        facets = _facets(db, cand)
+        keep = [x[0] for x in cand if _json_keep(facets[x[0]], actor, industry, platform, cve, technique, tactic)]
+        if key == "iocs":  # stable: ties keep the id order from SQL
+            keep.sort(key=lambda i: facets[i]["iocs"], reverse=desc)
+        total = len(keep)
+        page_ids = keep[(page - 1) * page_size: page * page_size]
+    loaded = {r.id: r for r in db.query(Research).filter(Research.id.in_(page_ids)).all()} if page_ids else {}
+    page_rows = [loaded[i] for i in page_ids if i in loaded]
+    ids = [r.id for r in page_rows]
+    by_r: dict[str, list[Result]] = {}
+    for x in (db.query(Result).filter(Result.research_id.in_(ids)).all() if ids else []):
+        by_r.setdefault(x.research_id, []).append(x)
     users = _users(db)
-    return {"total": total, "page": page, "page_size": page_size,
+    return {"total": total, "page": page, "page_size": page_size, "pages": -(-total // page_size),
             "items": [research_summary(r, by_r.get(r.id, []), users, ws if ws != "all" else None) for r in page_rows]}
+
+
+# ------------------------------------------------------------------ notifications (B19)
+# Declared before /{rid} so "notifications" is not taken for a research id. Stored as activity_event rows of type
+# "mention" with meta {target, comment_id, thread_id, section, kind: mention|reply, read}; user_id is who wrote it.
+
+SECTION_LABELS = {
+    "executive_summary": "Executive summary", "impact": "Impact", "recommendations": "Recommendations", "result": "Result",
+    "vulnerabilities": "Vulnerabilities", "threat_actors": "Threat actors", "attack_paths": "Attack paths",
+    "mitre": "MITRE ATT&CK", "detection_opportunities": "Detection opportunities", "ioas": "Indicators of attack",
+    "tools_used": "Tools used", "malware_tools": "Malware and tools", "workflow": "Workflow", "hunts": "Hunts", "iocs": "IoCs",
+    "industries": "Industries", "timeline": "Timeline", "sources": "Sources", "claims": "Claims", "conflicts": "Conflicts",
+    "study": "Study", "title": "Title", "tlp": "TLP", "severity": "Severity", "confidence": "Confidence",
+    "classification": "Classification", "tags": "Tags", "geography": "Geography", "log_sources_required": "Log sources",
+    "coverage_gaps": "Coverage gaps", "applicability": "Applicability", "results": "Results", "patching_insufficient": "Patching",
+    "affected_technologies": "Affected technologies", "related_research_ids": "Related research",
+}
+
+
+def section_label(section: str | None) -> str:
+    return SECTION_LABELS.get(section or "", (section or "General").replace("_", " ").capitalize())
+
+
+def _notifications_for(db: Session, user_id: str):
+    return db.query(ActivityEvent).filter(ActivityEvent.type == "mention",
+                                          ActivityEvent.meta["target"].as_string() == user_id)
+
+
+@router.get("/notifications")
+def notifications(db: Session = Depends(get_db), user: User = Depends(current_user), limit: int = 30):
+    """The current user's mention / reply notifications, newest first, with the unread count."""
+    base = _notifications_for(db, user.id)
+    rows = base.order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc()).limit(max(1, min(limit, 100))).all()
+    unread = base.filter(ActivityEvent.meta["read"].as_boolean().isnot(True)).count()
+    users = _users(db)
+    ids = {e.research_id for e in rows if e.research_id}
+    titles = {rid: t for rid, t in db.query(Research.id, Research.title).filter(Research.id.in_(ids))} if ids else {}
+    items = []
+    for e in rows:
+        m = e.meta or {}
+        items.append({"id": e.id, "kind": m.get("kind", "mention"), "research_id": e.research_id,
+                      "research_title": titles.get(e.research_id, ""), "section": m.get("section"),
+                      "section_label": section_label(m.get("section")) if m.get("section") else "General",
+                      "comment_id": m.get("comment_id"), "thread_id": m.get("thread_id"), "message": e.message,
+                      "by": user_dict(users.get(e.user_id)), "created_at": iso(e.created_at), "read": bool(m.get("read"))})
+    return {"unread": unread, "items": items}
+
+
+class NotificationsRead(BaseModel):
+    ids: list[int] = []  # empty: mark all read
+
+
+@router.post("/notifications/read")
+def notifications_read(body: NotificationsRead, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    q = _notifications_for(db, user.id)
+    if body.ids:
+        q = q.filter(ActivityEvent.id.in_(body.ids))
+    n = 0
+    for e in q.all():
+        if not (e.meta or {}).get("read"):
+            e.meta = {**(e.meta or {}), "read": True}
+            n += 1
+    db.commit()
+    return {"marked": n}
 
 
 class DupCheck(BaseModel):
@@ -210,7 +361,7 @@ def get_research(rid: str, db: Session = Depends(get_db), ws: str | None = None)
     return {
         **research_summary(r, results, users, ws),
         # Records saved before queries/opportunities carried a source trail get it filled in on read.
-        "record": backfill_provenance(copy.deepcopy(r.record or {})), "seed": r.seed,
+        "record": refresh_coverage_gaps(db, backfill_provenance(copy.deepcopy(r.record or {})), r.workspace_ids or []), "seed": r.seed,
         "reviewed_by": user_dict(users.get(r.reviewed_by)),
         "results": [{"workspace_id": x.workspace_id, "status": x.status, "summary": x.summary, "hunt_window": x.hunt_window,
                      "queries_run": x.queries_run, "analyst": user_dict(users.get(x.analyst_id)), "updated_at": iso(x.updated_at)} for x in results],
@@ -708,7 +859,7 @@ def list_queries(rid: str, db: Session = Depends(get_db), ws: str | None = None,
         w = db.get(Workspace, ws)
         if w is None:
             raise HTTPException(404, "Workspace not found")
-    rec = backfill_provenance(copy.deepcopy(r.record or {}))
+    rec = refresh_coverage_gaps(db, backfill_provenance(copy.deepcopy(r.record or {})), r.workspace_ids or [])
     items = []
     for q in (rec.get("hunts") or {}).get("queries", []):
         if platform and q.get("platform") != platform:
@@ -868,7 +1019,8 @@ def version_detail(rid: str, version: int, db: Session = Depends(get_db)):
 @router.get("/{rid}/activity")
 def activity(rid: str, db: Session = Depends(get_db)):
     users = _users(db)
-    rows = db.query(ActivityEvent).filter_by(research_id=rid).order_by(ActivityEvent.created_at.desc()).all()
+    rows = (db.query(ActivityEvent).filter(ActivityEvent.research_id == rid, ActivityEvent.type != "mention")
+            .order_by(ActivityEvent.created_at.desc()).all())
     exports = db.query(ExportLog).filter_by(research_id=rid).order_by(ExportLog.created_at.desc()).all()
     return {"events": [{"id": e.id, "type": e.type, "message": e.message, "user": user_dict(users.get(e.user_id)),
                         "created_at": iso(e.created_at), "meta": e.meta} for e in rows],
@@ -879,14 +1031,363 @@ def activity(rid: str, db: Session = Depends(get_db)):
 class CommentIn(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     section: str | None = None
+    parent_id: int | None = None  # reply to a thread (any comment in it); the reply joins the root's thread and section
+    mentions: list[str] = []  # user ids; "@Name" / "@id" tokens in the message are detected too
+
+
+def _comment_dict(e: ActivityEvent, users: dict[str, User]) -> dict:
+    m = e.meta or {}
+    return {"id": e.id, "section": m.get("section"), "section_label": section_label(m.get("section")) if m.get("section") else "General",
+            "parent_id": m.get("parent_id"), "message": e.message, "user": user_dict(users.get(e.user_id)),
+            "created_at": iso(e.created_at), "mentions": [user_dict(users[u]) for u in m.get("mentions", []) if u in users],
+            "resolved": bool(m.get("resolved")), "resolved_by": user_dict(users.get(m.get("resolved_by") or "")),
+            "resolved_at": m.get("resolved_at")}
+
+
+def _mentioned(message: str, explicit: list[str], users: dict[str, User]) -> list[str]:
+    out = [u for u in explicit if u in users]
+    for u in users.values():
+        if u.id in out:
+            continue
+        if re.search(rf"@{re.escape(u.name)}(?!\w)", message, re.I) or re.search(rf"@{re.escape(u.id)}(?!\w)", message, re.I):
+            out.append(u.id)
+    return out
+
+
+def _comment_event(db: Session, rid: str, cid: int) -> ActivityEvent:
+    e = db.get(ActivityEvent, cid)
+    if e is None or e.research_id != rid or e.type != "comment":
+        raise HTTPException(404, "Comment not found")
+    return e
+
+
+@router.get("/{rid}/comments")
+def list_comments(rid: str, db: Session = Depends(get_db), section: str | None = None):
+    """Comment threads (root + replies, oldest first) and per-section counts {section: {threads, open, comments}}.
+    Global comments have section null (key "" in counts)."""
+    _get(db, rid)
+    users = _users(db)
+    rows = db.query(ActivityEvent).filter_by(research_id=rid, type="comment").order_by(ActivityEvent.created_at, ActivityEvent.id).all()
+    threads: dict[int, dict] = {}
+    replies: list[ActivityEvent] = []
+    for e in rows:
+        if (e.meta or {}).get("parent_id"):
+            replies.append(e)
+        else:
+            threads[e.id] = {**_comment_dict(e, users), "replies": []}
+    for e in replies:
+        t = threads.get((e.meta or {}).get("parent_id"))
+        if t is not None:
+            t["replies"].append(_comment_dict(e, users))
+    counts: dict[str, dict] = {}
+    for t in threads.values():
+        c = counts.setdefault(t["section"] or "", {"threads": 0, "open": 0, "comments": 0})
+        c["threads"] += 1
+        c["comments"] += 1 + len(t["replies"])
+        c["open"] += 0 if t["resolved"] else 1
+    items = [t for t in threads.values() if section is None or (t["section"] or "") == section]
+    return {"threads": items, "counts": counts}
 
 
 @router.post("/{rid}/comments")
 def comment(rid: str, body: CommentIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Add a comment (global, on a section, or a reply). Mentioned users, and on a reply the thread's participants,
+    get a notification (GET /api/research/notifications)."""
     _get(db, rid)
-    log_activity(db, rid, "comment", body.message, user.id, section=body.section)
+    section, parent_id, root = body.section, None, None
+    if body.parent_id is not None:
+        parent = _comment_event(db, rid, body.parent_id)
+        parent_id = (parent.meta or {}).get("parent_id") or parent.id
+        root = _comment_event(db, rid, parent_id)
+        section = (root.meta or {}).get("section")
+    users = _users(db)
+    mentions = _mentioned(body.message, body.mentions, users)
+    e = ActivityEvent(research_id=rid, type="comment", message=body.message, user_id=user.id,
+                      meta={"section": section, "parent_id": parent_id, "mentions": mentions})
+    db.add(e)
+    db.flush()
+    notify = {u: "mention" for u in mentions}
+    if root is not None:
+        if (root.meta or {}).get("resolved"):  # a reply reopens a resolved thread
+            root.meta = {**(root.meta or {}), "resolved": False, "resolved_by": None, "resolved_at": None}
+        others = db.query(ActivityEvent).filter(ActivityEvent.research_id == rid, ActivityEvent.type == "comment",
+                                                ActivityEvent.meta["parent_id"].as_integer() == root.id).all()
+        for p in [root.user_id] + [x.user_id for x in others]:
+            if p:
+                notify.setdefault(p, "reply")
+    snippet = body.message if len(body.message) <= 200 else body.message[:199] + "…"
+    for target, kind in notify.items():
+        if target != user.id:
+            db.add(ActivityEvent(research_id=rid, type="mention", message=snippet, user_id=user.id,
+                                 meta={"target": target, "comment_id": e.id, "thread_id": parent_id or e.id,
+                                       "section": section, "kind": kind, "read": False}))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "comment": _comment_dict(e, users), "notified": sorted(t for t in notify if t != user.id)}
+
+
+class ResolveIn(BaseModel):
+    resolved: bool = True
+
+
+@router.post("/{rid}/comments/{cid}/resolve")
+def resolve_comment(rid: str, cid: int, body: ResolveIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Resolve (or reopen with resolved=false) the thread that comment `cid` belongs to."""
+    e = _comment_event(db, rid, cid)
+    root = _comment_event(db, rid, (e.meta or {}).get("parent_id") or e.id)
+    root.meta = {**(root.meta or {}), "resolved": body.resolved, "resolved_by": user.id if body.resolved else None,
+                 "resolved_at": datetime.now(timezone.utc).isoformat() if body.resolved else None}
+    sec = (root.meta or {}).get("section")
+    where = section_label(sec) if sec else "the report"
+    log_activity(db, rid, "comment_status", f"Thread on {where} {'resolved' if body.resolved else 'reopened'} by {user.name}",
+                 user.id, section=sec, thread_id=root.id, resolved=body.resolved)
+    db.commit()
+    return _comment_dict(root, _users(db))
+
+
+# ------------------------------------------------------------------ version diff (B27)
+# Lists are matched by a stable key where the item has one; keyless lists (recommendations, claims, timeline…) are
+# aligned by sequence so an edited item reads as "recommendation 3 changed" rather than one removed plus one added.
+
+DIFF_SKIP = {"id", "version", "schema_version", "updated_at", "review", "_edited", "status", "run", "demo_note"}
+
+
+def _low(v) -> str:
+    return str(v or "").strip().lower()
+
+
+DIFF_KEYS = {
+    "iocs": lambda x: (_low(x.get("type")), _low(x.get("value"))),
+    "mitre": lambda x: (x.get("technique_id"), x.get("tactic_id")),
+    "hunts.queries": lambda x: (x.get("group") or x.get("id"), x.get("platform")),
+    "sources": lambda x: x.get("url") or x.get("id"),
+    "vulnerabilities": lambda x: _low(x.get("cve")),
+    "threat_actors": lambda x: _low(x.get("name")),
+    "malware_tools": lambda x: _low(x.get("name")),
+    "tools_used": lambda x: _low(x.get("name")),
+    "industries": lambda x: _low(x.get("industry")),
+    "attack_paths": lambda x: x.get("id"),
+    "ioas": lambda x: x.get("id"),
+    "detection_opportunities": lambda x: x.get("id"),
+    "results": lambda x: x.get("workspace_id"),
+    "applicability": lambda x: x.get("workspace_id"),
+    "coverage_gaps": lambda x: (x.get("workspace_id"), x.get("opportunity_id"), x.get("data_source")),
+    "log_sources_required": lambda x: x.get("data_source"),
+    "workflow": lambda x: x.get("step"),
+    "conflicts": lambda x: x.get("topic"),
+}
+
+ITEM_NOUN = {
+    "iocs": ("IoC", "IoCs"), "mitre": ("technique", "techniques"), "hunts.queries": ("query", "queries"),
+    "sources": ("source", "sources"), "vulnerabilities": ("CVE", "CVEs"), "threat_actors": ("actor", "actors"),
+    "malware_tools": ("tool", "tools"), "tools_used": ("tool", "tools"), "industries": ("industry", "industries"),
+    "attack_paths": ("attack path", "attack paths"), "ioas": ("IoA", "IoAs"),
+    "detection_opportunities": ("opportunity", "opportunities"), "recommendations": ("recommendation", "recommendations"),
+    "claims": ("claim", "claims"), "timeline": ("timeline event", "timeline events"), "conflicts": ("conflict", "conflicts"),
+    "results": ("result", "results"), "coverage_gaps": ("gap", "gaps"), "log_sources_required": ("log source", "log sources"),
+}
+
+
+def _item_label(path: str, x) -> str:
+    if not isinstance(x, dict):
+        return str(x)[:120]
+    if path == "iocs":
+        return f"{x.get('type', '')}: {x.get('value', '')}"
+    if path == "mitre":
+        return f"{x.get('technique_id', '')} {x.get('technique', '')} ({x.get('tactic', x.get('tactic_id', ''))})".strip()
+    if path == "hunts.queries":
+        return f"{x.get('group') or x.get('id')} · {x.get('platform', '')} — {x.get('title', '')}".strip(" —")
+    for k in ("cve", "name", "industry", "title", "action", "statement", "event", "description", "topic", "url", "step",
+              "workspace_id", "data_source", "id"):
+        if x.get(k):
+            return str(x[k])[:160]
+    return json_short(x)
+
+
+def json_short(v, n: int = 160) -> str:
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _word_ops(a: str, b: str) -> list[dict]:
+    """Word-level diff of two strings: [{op: eq|add|del, text}]."""
+    ta, tb = re.findall(r"\s+|[^\s]+", a), re.findall(r"\s+|[^\s]+", b)
+    out: list[dict] = []
+
+    def put(op, words):
+        if not words:
+            return
+        if out and out[-1]["op"] == op:
+            out[-1]["text"] += "".join(words)
+        else:
+            out.append({"op": op, "text": "".join(words)})
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ta, tb, autojunk=False).get_opcodes():
+        if tag == "equal":
+            put("eq", ta[i1:i2])
+        else:
+            put("del", ta[i1:i2])
+            put("add", tb[j1:j2])
+    return out
+
+
+def _as_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list) and all(isinstance(x, (str, int, float)) for x in v):
+        return ", ".join(str(x) for x in v)
+    return json_short(v, 4000)
+
+
+def _field_changes(a, b) -> list[dict]:
+    """Field-level changes between two dict items (or two scalars under field "value")."""
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        a, b = {"value": a}, {"value": b}
+    out = []
+    for k in list(dict.fromkeys([*a.keys(), *b.keys()])):
+        if k.startswith("_") or k in ("lint",):
+            continue
+        if a.get(k) != b.get(k):
+            ta, tb = _as_text(a.get(k)), _as_text(b.get(k))
+            out.append({"field": k, "before": ta, "after": tb, "ops": _word_ops(ta, tb)})
+    return out
+
+
+def _strip(x):
+    return {k: v for k, v in x.items() if not k.startswith("_")} if isinstance(x, dict) else x
+
+
+def _list_diff(path: str, a: list, b: list) -> dict:
+    keyf = DIFF_KEYS.get(path)
+    added, removed, changed = [], [], []
+    if keyf and all(isinstance(x, dict) for x in a + b):
+        ka = {}
+        for x in a:
+            ka.setdefault(keyf(x), x)
+        kb = {}
+        for x in b:
+            kb.setdefault(keyf(x), x)
+        for i, x in enumerate(b):
+            k = keyf(x)
+            if kb.get(k) is not x:
+                continue
+            if k not in ka:
+                added.append({"index": i + 1, "label": _item_label(path, x), "item": _strip(x)})
+            elif _strip(ka[k]) != _strip(x):
+                fields = _field_changes(_strip(ka[k]), _strip(x))
+                if fields:
+                    changed.append({"index": i + 1, "label": _item_label(path, x), "fields": fields})
+        for i, x in enumerate(a):
+            if keyf(x) not in kb and ka.get(keyf(x)) is x:
+                removed.append({"index": i + 1, "label": _item_label(path, x), "item": _strip(x)})
+    else:
+        sa = [json.dumps(_strip(x), sort_keys=True, default=str) for x in a]
+        sb = [json.dumps(_strip(x), sort_keys=True, default=str) for x in b]
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, sa, sb, autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            pairs = min(i2 - i1, j2 - j1) if tag == "replace" else 0
+            for n in range(pairs):
+                x, y = a[i1 + n], b[j1 + n]
+                changed.append({"index": j1 + n + 1, "label": _item_label(path, y), "fields": _field_changes(_strip(x), _strip(y))})
+            for n in range(i1 + pairs, i2):
+                removed.append({"index": n + 1, "label": _item_label(path, a[n]), "item": _strip(a[n])})
+            for n in range(j1 + pairs, j2):
+                added.append({"index": n + 1, "label": _item_label(path, b[n]), "item": _strip(b[n])})
+    one, many = ITEM_NOUN.get(path, ("item", "items"))
+    bits = []
+    if added:
+        bits.append(f"+{len(added)} {one if len(added) == 1 else many}")
+    if removed:
+        bits.append(f"−{len(removed)} {one if len(removed) == 1 else many}")
+    if len(changed) == 1 and not keyf:
+        bits.append(f"{one} {changed[0]['index']} changed")
+    elif changed:
+        bits.append(f"{len(changed)} {one if len(changed) == 1 else many} changed")
+    return {"kind": "list", "added": added, "removed": removed, "changed": changed, "summary": ", ".join(bits),
+            "count_before": len(a), "count_after": len(b)}
+
+
+def _section_diff(key: str, a, b) -> list[dict]:
+    """One or more diff entries for a top-level record key (hunts splits into its query list and settings)."""
+    if key == "hunts" and isinstance(a or {}, dict) and isinstance(b or {}, dict):
+        a, b = a or {}, b or {}
+        out = []
+        qa, qb = a.get("queries", []) or [], b.get("queries", []) or []
+        if qa != qb:
+            d = _list_diff("hunts.queries", qa, qb)
+            if d["added"] or d["removed"] or d["changed"]:
+                out.append({"section": "hunts", "label": "Hunts", **d})
+        rest_a = {k: v for k, v in a.items() if k == "platforms" or k == "lookback_days"}
+        rest_b = {k: v for k, v in b.items() if k == "platforms" or k == "lookback_days"}
+        if rest_a != rest_b:
+            fields = _field_changes(rest_a, rest_b)
+            out.append({"section": "hunts", "label": "Hunt settings", "kind": "object", "fields": fields,
+                        "summary": ", ".join(f"{f['field'].replace('_', ' ')} changed" for f in fields)})
+        return out
+    label = section_label(key)
+    if isinstance(a, list) or isinstance(b, list):
+        if all(not isinstance(x, dict) for x in (a or []) + (b or [])):  # list of strings (tags, geography…)
+            sa, sb = [str(x) for x in a or []], [str(x) for x in b or []]
+            add = [x for x in sb if x not in sa]
+            rem = [x for x in sa if x not in sb]
+            bits = ([f"+{len(add)}"] if add else []) + ([f"−{len(rem)}"] if rem else []) or ["reordered"]
+            return [{"section": key, "label": label, "kind": "list", "summary": " ".join(bits),
+                     "added": [{"index": sb.index(x) + 1, "label": x, "item": x} for x in add],
+                     "removed": [{"index": sa.index(x) + 1, "label": x, "item": x} for x in rem], "changed": [],
+                     "count_before": len(sa), "count_after": len(sb)}]
+        d = _list_diff(key, a or [], b or [])
+        return [{"section": key, "label": label, **d}] if (d["added"] or d["removed"] or d["changed"]) else []
+    if isinstance(a, dict) or isinstance(b, dict):
+        fields = _field_changes(_strip(a or {}), _strip(b or {}))
+        if not fields:
+            return []
+        return [{"section": key, "label": label, "kind": "object", "fields": fields,
+                 "summary": ", ".join(f"{f['field'].replace('_', ' ')} changed" for f in fields[:4]) + ("…" if len(fields) > 4 else "")}]
+    ta, tb = _as_text(a), _as_text(b)
+    verb = "added" if not ta else "removed" if not tb else "changed"
+    return [{"section": key, "label": label, "kind": "text", "before": ta, "after": tb, "ops": _word_ops(ta, tb),
+             "summary": f"{label} {verb}"}]
+
+
+def record_diff(a: dict, b: dict) -> list[dict]:
+    order = list(SECTION_LABELS)
+    keys = [k for k in dict.fromkeys([*order, *(a or {}).keys(), *(b or {}).keys()])
+            if k not in DIFF_SKIP and not k.startswith("_") and (a or {}).get(k) != (b or {}).get(k)
+            and ((a or {}).get(k) not in (None, [], {}, "") or (b or {}).get(k) not in (None, [], {}, ""))]
+    out = []
+    for k in keys:
+        out += _section_diff(k, (a or {}).get(k), (b or {}).get(k))
+    return out
+
+
+def _version_record(db: Session, r: Research, v: int | None) -> tuple[int, dict]:
+    if v is None or v == r.version:
+        return r.version, r.record or {}
+    row = db.query(ResearchVersion).filter_by(research_id=r.id, version=v).order_by(ResearchVersion.id.desc()).first()
+    if row is None:
+        raise HTTPException(404, f"Version {v} not found")
+    return v, row.record or {}
+
+
+@router.get("/{rid}/diff")
+def diff(rid: str, db: Session = Depends(get_db), from_: int | None = Q(default=None, alias="from"),
+         to: int | None = None):
+    """Structured diff between two versions (default: previous → current). Each section entry carries a summary
+    ("+2 IoCs, −1 technique"), and list sections carry added / removed / changed items with field-level word diffs."""
+    r = _get(db, rid)
+    to_v, b = _version_record(db, r, to)
+    if from_ is None:  # the latest stored version before `to` (version numbers can have gaps)
+        prev = (db.query(ResearchVersion.version).filter(ResearchVersion.research_id == rid, ResearchVersion.version < to_v)
+                .order_by(ResearchVersion.version.desc()).first())
+        from_ = prev[0] if prev else 0
+    if from_ < 1:
+        from_v, a = 0, {}
+    else:
+        from_v, a = _version_record(db, r, from_)
+    sections = record_diff(a, b)
+    return {"research_id": rid, "from": from_v, "to": to_v, "sections": sections,
+            "summary": "; ".join(f"{s['label']}: {s['summary']}" for s in sections if s.get("summary")) or "No differences"}
 
 
 # ------------------------------------------------------------------ exports
