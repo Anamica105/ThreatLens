@@ -169,7 +169,7 @@ async def inbound(request: Request, db: Session = Depends(get_db)):
             "research_id": out["item"].get("research_id")}
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(current_user)])
 def list_items(db: Session = Depends(get_db), limit: int = 50):
     return {"items": [intake.item_summary(x) for x in intake.list_items(db, max(1, min(limit, 200)))]}
 
@@ -180,7 +180,7 @@ class RoutingIn(BaseModel):
     user_id: str | None = None
 
 
-@router.get("/routing")
+@router.get("/routing", dependencies=[Depends(current_user)])
 def get_routing(db: Session = Depends(get_db)):
     return intake.get_routing(db) | {"webhook_configured": bool(os.environ.get("INTAKE_WEBHOOK_SECRET"))}
 
@@ -197,7 +197,7 @@ def put_routing(body: RoutingIn, db: Session = Depends(get_db), user: User = Dep
         raise HTTPException(422, str(e))
 
 
-@router.get("/{iid}")
+@router.get("/{iid}", dependencies=[Depends(current_user)])
 def get_item(iid: str, db: Session = Depends(get_db)):
     item = intake.get_item(db, iid)
     if item is None:
@@ -222,7 +222,7 @@ def create_draft(iid: str, body: DraftIn, db: Session = Depends(get_db), user: U
     return {**out, "item": intake.item_summary(intake.get_item(db, iid) or item)}
 
 
-@router.post("/{iid}/dismiss")
+@router.post("/{iid}/dismiss", dependencies=[Depends(current_user)])
 def dismiss(iid: str, db: Session = Depends(get_db)):
     item = get_item(iid, db)
     if item.get("research_id"):

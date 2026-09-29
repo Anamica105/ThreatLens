@@ -9,8 +9,10 @@ Check Point Research. Fetchers never submit forms or log in.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import re
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse
@@ -182,6 +184,31 @@ def discover(entities: dict, seed_urls: list[str], vendor_ids: list[str] | None,
     return out[:limit]
 
 
+def is_public_url(url: str) -> bool:
+    """SSRF guard: only http(s) URLs whose host resolves exclusively to public (globally routable) addresses.
+    Seed URLs come from users and inbound email, so without this a fetch could reach cloud metadata or internal services."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except (ValueError, OSError):
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            return False
+    return bool(infos)
+
+
+def _guard_request(request: httpx.Request) -> None:
+    """httpx event hook: re-checks every hop, including redirects."""
+    if not is_public_url(str(request.url)):
+        raise httpx.RequestError(f"Blocked non-public address {request.url.host}", request=request)
+
+
 def _playwright_text(url: str) -> tuple[str, str]:
     from playwright.sync_api import sync_playwright  # optional dependency
 
@@ -189,6 +216,8 @@ def _playwright_text(url: str) -> tuple[str, str]:
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page(user_agent=UA)
+            # Block every sub-request (redirects, frames, scripts, XHR) that targets a non-public address.
+            page.route("**/*", lambda route: route.continue_() if is_public_url(route.request.url) else route.abort())
             page.goto(url, wait_until="networkidle", timeout=45000)
             html = page.content()
             title = page.title()
@@ -215,8 +244,13 @@ def relevance(text: str, entities: dict) -> int:
 def fetch(url: str, logf=lambda m, level="info": None) -> dict:
     """Fetch an article and extract its main text. Returns {text, title, published, last_modified, content_hash, method}."""
     html, title, last_modified, method = "", "", None, "httpx"
+    if not is_public_url(url):
+        logf(f"Skipped {url}: not a public http(s) address", "warn")
+        return {"text": "", "title": "", "published": None, "last_modified": None,
+                "content_hash": "", "method": method}
     try:
-        with httpx.Client(timeout=get_settings().fetch_timeout, headers={"User-Agent": UA}, follow_redirects=True) as client:
+        with httpx.Client(timeout=get_settings().fetch_timeout, headers={"User-Agent": UA}, follow_redirects=True,
+                          event_hooks={"request": [_guard_request]}) as client:
             r = client.get(url)
             r.raise_for_status()
             # Decode from the declared charset, else UTF-8 (httpx's fallback guesses mangle many vendor blogs).
