@@ -9,11 +9,13 @@ import io
 import json
 import re
 from email.message import EmailMessage
+from html import escape as html_escape
 from email.policy import SMTP
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from ..sources import is_public_url
 from . import context as C
 
 _env = Environment(loader=FileSystemLoader(Path(__file__).parent / "templates"), autoescape=select_autoescape(["html"]))
@@ -46,6 +48,7 @@ def eml(vm: dict) -> bytes:
 def html_to_pdf(html: str, header_left: str, header_right: str, footer_left: str) -> bytes:
     from playwright.sync_api import sync_playwright
 
+    header_left, header_right, footer_left = (html_escape(x) for x in (header_left, header_right, footer_left))
     style = "font-family:Segoe UI,Arial,sans-serif;font-size:7.5pt;color:#525B6B;width:100%;padding:0 16mm;display:flex;justify-content:space-between;"
     header = f'<div style="{style}"><span>{header_left}</span><span style="font-weight:600;color:#2A303B">{header_right}</span></div>'
     footer = (f'<div style="{style}"><span>{footer_left}</span><span>Page <span class="pageNumber"></span> of '
@@ -54,6 +57,10 @@ def html_to_pdf(html: str, header_left: str, header_right: str, footer_left: str
         browser = p.chromium.launch()
         try:
             page = browser.new_page()
+            # The report is built from research content (LLM output, article text, hunter edits): let it load only
+            # inline data and public http(s) resources, never internal addresses (SSRF from the renderer).
+            page.route("**/*", lambda route: route.continue_()
+                       if route.request.url.startswith("data:") or is_public_url(route.request.url) else route.abort())
             page.set_content(html, wait_until="networkidle", timeout=30000)
             return page.pdf(format="A4", print_background=True, display_header_footer=True, header_template=header,
                             footer_template=footer, margin={"top": "18mm", "bottom": "18mm", "left": "16mm", "right": "16mm"})

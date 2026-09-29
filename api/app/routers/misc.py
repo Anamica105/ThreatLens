@@ -115,6 +115,9 @@ def get_workspace(wid: str, db: Session = Depends(get_db)):
 
 
 def _validate_ws(body: WorkspaceIn):
+    # The logo is only ever set by the upload endpoint, which checks type and size. A client-supplied
+    # logo_data_uri could be any URL (a tracking pixel or internal address in every emailed report).
+    body.branding.pop("logo_data_uri", None)
     bad = [p for p in body.platforms if p not in detection.PLATFORM_IDS]
     if bad:
         raise HTTPException(422, f"Unknown platform(s): {', '.join(bad)}")

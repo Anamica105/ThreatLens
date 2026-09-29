@@ -36,6 +36,10 @@ for r in (interop.router, research.router, intake.router, ioc_review.router, run
 
 
 def startup() -> None:
+    if (get_settings().auth_mode or "dev").lower() == "dev":
+        logging.getLogger("threatlens.auth").warning(
+            "AUTH_MODE=dev: any caller can act as any user (X-User header). Keep the app on localhost; "
+            "use AUTH_MODE=header behind an OIDC proxy for shared deployments.")
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         attack.load_catalog(db)

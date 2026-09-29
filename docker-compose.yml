@@ -1,6 +1,8 @@
 # Production-style stack: PostgreSQL + API + web.
 #   docker compose up --build        then open http://localhost:3000
 # Put secrets (ANTHROPIC_API_KEY, BRAVE_SEARCH_API_KEY, OSINT keys) in api/.env.
+# Ports are bound to 127.0.0.1: with the default AUTH_MODE=dev anyone who can reach the app can act as any user,
+# including admin. To serve other machines, set AUTH_MODE=header behind an OIDC proxy (see README) first.
 services:
   db:
     image: postgres:16
@@ -23,12 +25,12 @@ services:
     volumes: [apidata:/app/data]
     depends_on:
       db: { condition: service_healthy }
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
 
   web:
     build: ./web
     depends_on: [api]
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
 
 volumes:
   pgdata:
