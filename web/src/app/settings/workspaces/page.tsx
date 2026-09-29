@@ -8,12 +8,13 @@ import { ButtonLink } from "@/components/ui/button";
 import { Page, PageHeader } from "@/components/ui/layout";
 
 export default function WorkspacesList() {
-  const { workspaces, platformName } = useApp();
+  const { user, workspaces, platformName } = useApp();
+  const canEdit = user?.role === "lead" || user?.role === "admin";
   return (
     <Page>
       <PageHeader crumbs={[{ label: "Settings", href: "/settings" }, { label: "Workspaces" }]} title="Workspaces"
         description="A workspace is a client profile: a filter plus defaults, not an isolation boundary."
-        actions={<ButtonLink href="/settings/workspaces/new" variant="primary" icon={<Plus />}>New workspace</ButtonLink>} />
+        actions={canEdit && <ButtonLink href="/settings/workspaces/new" variant="primary" icon={<Plus />}>New workspace</ButtonLink>} />
       <div className="overflow-x-auto rounded-md border border-line bg-surface">
         <table className="tl-table tl-comfortable w-full">
           <thead><tr><th>Workspace</th><th>Industry</th><th>Output platforms</th><th>Technology in scope</th><th className="num">Research</th><th>Default TLP</th></tr></thead>

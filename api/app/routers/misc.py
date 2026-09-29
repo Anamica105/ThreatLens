@@ -114,6 +114,16 @@ def get_workspace(wid: str, db: Session = Depends(get_db)):
     return workspace_dict(w)
 
 
+WORKSPACE_ADMIN_ROLES = ("lead", "admin")
+
+
+def _require_workspace_admin(user: User) -> None:
+    # Workspace settings (platforms, field mappings, log sources, branding) shape every query and report sent to
+    # that client, so only leads and admins may change them.
+    if user.role not in WORKSPACE_ADMIN_ROLES:
+        raise HTTPException(403, "Only leads and admins can change client workspaces")
+
+
 def _validate_ws(body: WorkspaceIn):
     # The logo is only ever set by the upload endpoint, which checks type and size. A client-supplied
     # logo_data_uri could be any URL (a tracking pixel or internal address in every emailed report).
@@ -127,6 +137,7 @@ def _validate_ws(body: WorkspaceIn):
 
 @router.post("/workspaces")
 def create_workspace(body: WorkspaceIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    _require_workspace_admin(user)
     _validate_ws(body)
     wid = slug(body.name)[:40]
     if db.get(Workspace, wid):
@@ -139,6 +150,7 @@ def create_workspace(body: WorkspaceIn, db: Session = Depends(get_db), user: Use
 
 @router.put("/workspaces/{wid}")
 def update_workspace(wid: str, body: WorkspaceIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    _require_workspace_admin(user)
     _validate_ws(body)
     w = db.get(Workspace, wid)
     if w is None:
@@ -154,6 +166,7 @@ def update_workspace(wid: str, body: WorkspaceIn, db: Session = Depends(get_db),
 
 @router.post("/workspaces/{wid}/logo")
 async def upload_logo(wid: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    _require_workspace_admin(user)
     w = db.get(Workspace, wid)
     if w is None:
         raise HTTPException(404, "Workspace not found")
