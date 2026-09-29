@@ -49,6 +49,25 @@ class Settings(BaseSettings):
     # Env THREATLENS_SECRET_KEY; if empty, one is generated into <data_dir>/.secret_key (gitignored) with a warning.
     threatlens_secret_key: str = ""
 
+    # Daily emerging-threat digest (app/digest.py). Once a day at digest_time_utc: rank what the vendor feeds published
+    # in the last digest_lookback_hours, research the top digest_max_threats for digest_workspace_id (first workspace
+    # if empty), and email the report + hunt queries to digest_recipients. Without SMTP the email is saved as .eml.
+    digest_enabled: bool = False
+    digest_time_utc: str = "06:30"
+    digest_recipients: str = ""  # comma-separated
+    digest_workspace_id: str = ""
+    digest_max_threats: int = 3
+    digest_lookback_hours: int = 36
+    digest_auto_research: bool = True  # false: headlines and article links only, no pipeline runs
+    digest_depth: str = "quick"
+    digest_max_queries: int = 8  # per threat, in the email body
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "ThreatLens <threatlens@localhost>"
+    smtp_starttls: bool = True  # ignored on port 465, which uses implicit TLS
+
     # Auth (spec section 12: SSO via OIDC).
     #   dev    - trust the `X-User` header sent by the web app's user switcher (falls back to the first user). Local only.
     #   header - trust only `auth_header` (an email set by an OIDC-validating reverse proxy such as oauth2-proxy),

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="color-scheme" content="light only">
+<title>Emerging threats · {{ day }}</title></head>
+<body style="margin:0;padding:0;background:#F7F8FA;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#F7F8FA"><tr><td align="center" style="padding:16px 8px;">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0" bgcolor="#FFFFFF" style="width:640px;max-width:640px;border:1px solid #E3E6EB;font-family:Arial,'Segoe UI',Helvetica,sans-serif;color:#181C23;">
+  <tr><td bgcolor="#F7F8FA" style="border-bottom:1px solid #E3E6EB;padding:8px 16px;font-size:12px;color:#525B6B;">
+    <b style="color:#2A303B;">ThreatLens</b> · Daily emerging-threat digest · {{ client }}
+  </td></tr>
+  <tr><td style="padding:20px 24px 4px 24px;">
+    <div style="font-size:22px;line-height:28px;font-weight:bold;">Emerging threats · {{ day }}</div>
+    <div style="font-size:13px;line-height:19px;color:#525B6B;margin-top:4px;">
+      {% if threats %}{{ threats|length }} new item{{ 's' if threats|length != 1 }} from the vendor feeds in the last {{ lookback }} h, ranked by corroboration, CVEs, government advisories and recency.
+      {% else %}Nothing new in the vendor feeds in the last {{ lookback }} h that has not already been sent this week.{% endif %}
+    </div>
+  </td></tr>
+  {% for t in threats %}
+  <tr><td style="padding:18px 24px 0 24px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #E3E6EB;">
+      <tr><td style="padding:14px 16px 4px 16px;border-left:4px solid {{ t.research.sev.solid if t.research and t.research.sev else '#857CCB' }};">
+        <div style="font-size:12px;color:#6A7384;">{{ loop.index }} · {{ t.label }}</div>
+        <div style="font-size:17px;line-height:23px;font-weight:bold;margin-top:2px;">{{ t.title }}</div>
+        <div style="font-size:12px;color:#525B6B;margin-top:4px;">{{ t.publishers|join(', ') }} · latest {{ t.newest }}{% if t.why %} · {{ t.why|join(', ') }}{% endif %}</div>
+      </td></tr>
+      {% if t.research and not t.research.redacted %}{% set r = t.research %}
+      <tr><td style="padding:8px 16px 0 16px;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>
+          <td bgcolor="{{ r.sev.soft }}" style="padding:3px 8px;font-size:12px;font-weight:bold;color:{{ r.sev.text }};">{{ r.sev.label }}</td><td width="6">&nbsp;</td>
+          <td bgcolor="#F0F2F5" style="padding:3px 8px;font-size:12px;font-weight:bold;color:#2A303B;">{{ (r.confidence or 'moderate')|capitalize }} confidence</td><td width="6">&nbsp;</td>
+          <td bgcolor="#F0F2F5" style="padding:3px 8px;font-size:12px;font-weight:bold;color:#2A303B;">TLP:{{ r.tlp }}</td><td width="6">&nbsp;</td>
+          <td bgcolor="#FFF4DB" style="padding:3px 8px;font-size:12px;font-weight:bold;color:#8F5A00;">Unreviewed draft{% if r.offline %} · offline mode{% endif %}</td>
+        </tr></table>
+      </td></tr>
+      <tr><td style="padding:10px 16px 0 16px;font-size:14px;line-height:21px;">
+        {% for p in r.summary %}<p style="margin:0 0 8px 0;">{{ p }}</p>{% endfor %}
+      </td></tr>
+      {% if r.recs %}<tr><td style="padding:2px 16px 0 16px;font-size:13px;line-height:19px;">
+        <div style="font-weight:bold;margin-bottom:4px;">Do now (0–48 h)</div>
+        {% for a in r.recs %}<div style="margin:0 0 3px 0;">• {{ a }}</div>{% endfor %}
+      </td></tr>{% endif %}
+      {% if r.ttps %}<tr><td style="padding:10px 16px 0 16px;font-size:13px;line-height:19px;">
+        <div style="font-weight:bold;margin-bottom:4px;">ATT&amp;CK techniques</div>
+        {% for m in r.ttps %}<span style="display:inline-block;background:#EFEDFA;color:#3F3790;padding:2px 6px;margin:0 4px 4px 0;font-size:12px;"><span style="font-family:Consolas,'Courier New',monospace;">{{ m.id }}</span>{% if m.name %} {{ m.name }}{% endif %}</span>{% endfor %}
+      </td></tr>{% endif %}
+      {% if r.iocs %}<tr><td style="padding:10px 16px 0 16px;">
+        <div style="font-size:13px;font-weight:bold;margin-bottom:4px;">Key indicators (defanged{% if r.n_iocs > r.iocs|length %}, {{ r.iocs|length }} of {{ r.n_iocs }}; full list attached as CSV{% endif %})</div>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="font-size:12px;line-height:17px;">
+          {% for i in r.iocs %}<tr><td width="70" style="padding:3px 0;border-bottom:1px solid #E3E6EB;color:#6A7384;">{{ i.type }}</td><td style="padding:3px 6px;border-bottom:1px solid #E3E6EB;font-family:Consolas,'Courier New',monospace;word-break:break-all;">{{ i.value }}</td><td width="80" align="right" style="padding:3px 0;border-bottom:1px solid #E3E6EB;color:#525B6B;">{{ i.verdict|capitalize }}</td></tr>{% endfor %}
+        </table>
+      </td></tr>{% endif %}
+      {% if r.queries %}<tr><td style="padding:12px 16px 0 16px;">
+        <div style="font-size:13px;font-weight:bold;margin-bottom:4px;">Hunt queries for {{ client }}{% if r.n_queries > r.queries|length %} ({{ r.queries|length }} of {{ r.n_queries }}; the rest are in the report){% endif %}</div>
+        {% for q in r.queries %}
+        <div style="font-size:12px;color:#525B6B;margin:8px 0 3px 0;"><b style="color:#2A303B;">{{ q.platform }}</b> · {{ q.type|upper }} · {{ q.title }}</div>
+        <pre style="margin:0;padding:8px 10px;background:#F7F8FA;border:1px solid #E3E6EB;font-family:Consolas,'Courier New',monospace;font-size:11px;line-height:15px;white-space:pre-wrap;word-break:break-all;">{{ q.body }}</pre>
+        {% endfor %}
+      </td></tr>{% endif %}
+      {% elif t.research and t.research.redacted %}
+      <tr><td style="padding:10px 16px 0 16px;font-size:13px;color:#9A1C35;">This research is TLP:RED, so its content is not emailed. Open the report in ThreatLens.</td></tr>
+      {% else %}
+      {% if t.failed %}<tr><td style="padding:10px 16px 0 16px;font-size:13px;color:#9A1C35;">Automated research did not finish. Open the run in ThreatLens to retry the failed stage.</td></tr>
+      {% elif researched %}<tr><td style="padding:10px 16px 0 16px;font-size:13px;color:#525B6B;">Not researched automatically. Start a run from the articles below.</td></tr>{% endif %}
+      {% if t.articles[0].summary %}<tr><td style="padding:10px 16px 0 16px;font-size:14px;line-height:21px;">{{ t.articles[0].summary }}</td></tr>{% endif %}
+      {% endif %}
+      {% if t.cves or t.actors or t.malware %}<tr><td style="padding:10px 16px 0 16px;font-size:12px;color:#525B6B;">
+        {% if t.cves %}<b>CVEs</b> {{ t.cves|join(', ') }} &nbsp; {% endif %}{% if t.actors %}<b>Actors</b> {{ t.actors|join(', ') }} &nbsp; {% endif %}{% if t.malware %}<b>Malware</b> {{ t.malware|join(', ') }}{% endif %}
+      </td></tr>{% endif %}
+      <tr><td style="padding:10px 16px 0 16px;font-size:12px;line-height:18px;">
+        <div style="font-weight:bold;color:#2A303B;margin-bottom:2px;">Sources</div>
+        {% for a in t.articles[:5] %}<div><a href="{{ a.url }}" style="color:#3F3790;">{{ a.title }}</a> <span style="color:#6A7384;">({{ a.publisher }})</span></div>{% endfor %}
+      </td></tr>
+      <tr><td style="padding:12px 16px 14px 16px;">
+        {% if t.report_url %}<a href="{{ t.report_url }}" style="display:inline-block;background:#5249A8;color:#FFFFFF;text-decoration:none;font-size:13px;font-weight:bold;padding:8px 14px;">Open the full report</a>
+        {% else %}<a href="{{ web }}/research/new" style="display:inline-block;background:#5249A8;color:#FFFFFF;text-decoration:none;font-size:13px;font-weight:bold;padding:8px 14px;">Start research</a>{% endif %}
+      </td></tr>
+    </table>
+  </td></tr>
+  {% endfor %}
+  <tr><td style="padding:18px 24px 20px 24px;font-size:11px;line-height:16px;color:#6A7384;">
+    Generated automatically by ThreatLens. Automated research is an unreviewed draft: verify indicators and queries against the linked sources and test queries in a non-production search before client use.
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>

@@ -81,6 +81,21 @@ def _score(text: str, kws: list[tuple[str, int]]) -> int:
     return sum(w for k, w in kws if re.search(rf"(?<![\w-]){re.escape(k.lower())}(?![\w-])", t))
 
 
+def pull_feeds(vendors: list[dict]) -> list[tuple[dict, object, Exception | None]]:
+    """Fetch and parse each vendor's RSS feed in parallel: [(vendor, parsed feed or None, error or None)]."""
+    def pull(v: dict):
+        try:
+            with httpx.Client(timeout=12, headers={"User-Agent": UA}, follow_redirects=True) as client:
+                r = client.get(v["feed"])
+                r.raise_for_status()
+                return v, feedparser.parse(r.content), None
+        except Exception as e:  # noqa: BLE001 - one bad feed must not stop discovery
+            return v, None, e
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(pull, [v for v in vendors if v["feed"]]))
+
+
 MIN_FEED_SCORE = 3  # one CVE or actor, or several weaker terms together
 
 
@@ -99,18 +114,7 @@ def discover(entities: dict, seed_urls: list[str], vendor_ids: list[str] | None,
 
     enabled = [v for v in VENDORS if (not vendor_ids or v["id"] in vendor_ids) and v["feed"]]
     if kws:
-        def pull(v: dict):
-            try:
-                with httpx.Client(timeout=12, headers={"User-Agent": UA}, follow_redirects=True) as client:
-                    r = client.get(v["feed"])
-                    r.raise_for_status()
-                    return v, feedparser.parse(r.content), None
-            except Exception as e:  # noqa: BLE001 - one bad feed must not stop discovery
-                return v, None, e
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            pulled = list(ex.map(pull, enabled))
-        for v, feed, err in pulled:
+        for v, feed, err in pull_feeds(enabled):
             if err is not None or feed is None:
                 logf(f"{v['name']} feed unavailable ({type(err).__name__})", "warn")
                 continue
