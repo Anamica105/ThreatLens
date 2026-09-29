@@ -8,7 +8,7 @@ lets every library show "Seen in research".
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Float
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -47,8 +47,8 @@ class Research(Base):
     __tablename__ = "research"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     title: Mapped[str] = mapped_column(String(200))
-    status: Mapped[str] = mapped_column(String(20), default="draft")  # draft, running, in_review, published, archived, failed
-    severity: Mapped[str] = mapped_column(String(20), default="medium")
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)  # draft, running, in_review, published, archived, failed
+    severity: Mapped[str] = mapped_column(String(20), default="medium", index=True)
     confidence: Mapped[str] = mapped_column(String(20), default="moderate")
     tlp: Mapped[str] = mapped_column(String(20), default="AMBER")
     classification: Mapped[list] = mapped_column(JSON, default=list)
@@ -56,8 +56,8 @@ class Research(Base):
     seed: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str | None] = mapped_column(ForeignKey("user.id"), nullable=True)
     reviewed_by: Mapped[str | None] = mapped_column(ForeignKey("user.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     search_text: Mapped[str] = mapped_column(Text, default="")
@@ -157,9 +157,9 @@ class Ioc(Base):
     __tablename__ = "ioc"
     __table_args__ = (UniqueConstraint("type", "value"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    type: Mapped[str] = mapped_column(String(20))
-    value: Mapped[str] = mapped_column(String(600))  # stored refanged; always displayed defanged
-    verdict: Mapped[str] = mapped_column(String(20), default="unknown")
+    type: Mapped[str] = mapped_column(String(20), index=True)
+    value: Mapped[str] = mapped_column(String(600), index=True)  # stored refanged; always displayed defanged
+    verdict: Mapped[str] = mapped_column(String(20), default="unknown", index=True)
     reputation: Mapped[dict] = mapped_column(JSON, default=dict)
     context: Mapped[list] = mapped_column(JSON, default=list)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -172,8 +172,8 @@ class Query(Base):
     __tablename__ = "query"
     id: Mapped[str] = mapped_column(String(40), primary_key=True)  # Q-0007
     title: Mapped[str] = mapped_column(String(200))
-    platform: Mapped[str] = mapped_column(String(30))
-    type: Mapped[str] = mapped_column(String(10))  # ioc, ioa, vuln, ttp
+    platform: Mapped[str] = mapped_column(String(30), index=True)
+    type: Mapped[str] = mapped_column(String(10), index=True)  # ioc, ioa, vuln, ttp
     body: Mapped[str] = mapped_column(Text)
     sigma_ref: Mapped[str | None] = mapped_column(String(40), nullable=True)
     log_sources: Mapped[list] = mapped_column(JSON, default=list)
@@ -208,13 +208,14 @@ class ResearchLink(Base):
 
 class ActivityEvent(Base):
     __tablename__ = "activity_event"
+    __table_args__ = (Index("ix_activity_event_research_created", "research_id", "created_at"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     research_id: Mapped[str | None] = mapped_column(ForeignKey("research.id", ondelete="CASCADE"), index=True, nullable=True)
     type: Mapped[str] = mapped_column(String(30))  # created, run_completed, edited, status, exported, comment, result
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     message: Mapped[str] = mapped_column(Text)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class ExportLog(Base):
@@ -228,6 +229,28 @@ class ExportLog(Base):
     file_name: Mapped[str] = mapped_column(String(200), default="")
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ExternalCache(Base):
+    """Cached responses from public reference feeds (NVD, CISA KEV, FIRST EPSS), keyed e.g. `nvd:CVE-2025-53770`."""
+
+    __tablename__ = "external_cache"
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AuditEvent(Base):
+    """Audit log of views (spec section 13). Edits and exports live in activity_event / export_log."""
+
+    __tablename__ = "audit_event"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(String(20), default="view")
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    entity_type: Mapped[str] = mapped_column(String(20), index=True)  # research, actor, malware, query, ioc, cve
+    entity_id: Mapped[str] = mapped_column(String(600), index=True)
+    path: Mapped[str] = mapped_column(String(600), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Setting(Base):

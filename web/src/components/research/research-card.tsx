@@ -48,7 +48,7 @@ export function ResearchCard({ r }: { r: ResearchSummary }) {
             </span>
           )}
           <span className="flex-1" />
-          <span className="text-caption text-fg-muted tabular">{num(r.counts.ttps)} TTPs · {num(r.counts.iocs)} IoCs · {num(r.counts.queries)} queries</span>
+          <span className="text-caption text-fg-muted tabular">{num(r.cves.length)} CVE{r.cves.length === 1 ? "" : "s"} · {num(r.counts.ttps)} TTPs · {num(r.counts.iocs)} IoCs · {num(r.counts.queries)} queries</span>
           <Avatar initials={r.author?.initials} title={r.author?.name} />
         </div>
       </div>

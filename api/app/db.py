@@ -37,3 +37,10 @@ def get_db() -> Iterator[Session]:
         yield db
     finally:
         db.close()
+
+
+@event.listens_for(Base.metadata, "after_create")
+def _after_create_all(metadata, connection, **_):
+    """create_all never alters existing tables; add new columns/indexes and encrypt legacy secrets (see migrate.py)."""
+    from .migrate import upgrade
+    upgrade(connection, metadata)

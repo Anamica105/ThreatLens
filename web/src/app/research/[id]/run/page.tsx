@@ -13,6 +13,9 @@ import { Page, PageHeader, Panel } from "@/components/ui/layout";
 import { get, post } from "@/lib/api";
 import { duration, elapsed, toDate, utc } from "@/lib/format";
 import type { ResearchDetail, RunDetail, RunLog, RunStage } from "@/lib/types";
+import { BudgetMeter, type RunBudget } from "./budget";
+
+type RunWithBudget = RunDetail & { budget?: RunBudget };
 
 function StageIcon({ state }: { state: RunStage["state"] }) {
   if (state === "done") return <CircleCheck className="size-5 text-success" />;
@@ -34,7 +37,7 @@ export default function RunProgress() {
   const wsHref = useWsHref();
   const toast = useToast();
   const [runId, setRunId] = useState<string | null>(null);
-  const [run, setRun] = useState<RunDetail | null>(null);
+  const [run, setRun] = useState<RunWithBudget | null>(null);
   const [logs, setLogs] = useState<RunLog[]>([]);
   const [error, setError] = useState<Error | null>(null);
   const [filter, setFilter] = useState<string | null>(null);
@@ -57,7 +60,7 @@ export default function RunProgress() {
     if (!runId || inFlight.current) return;
     inFlight.current = true;
     try {
-      const r = await get<RunDetail>(`/api/runs/${runId}?after_log=${lastLog.current}`);
+      const r = await get<RunWithBudget>(`/api/runs/${runId}?after_log=${lastLog.current}`);
       setRun(r);
       if (r.logs.length) {
         lastLog.current = Math.max(lastLog.current, r.logs[r.logs.length - 1].id);
@@ -126,6 +129,7 @@ export default function RunProgress() {
           <ButtonLink href={wsHref(`/research/${id}`)} variant={running ? "secondary" : "primary"}>Open research</ButtonLink>
         </>}>
         {run && <div className="mt-4 max-w-xl"><ProgressBar value={done} max={run.stages.length} label={running ? `Running · ${done} of ${run.stages.length} stages` : run.status === "done" ? "Complete" : run.status === "cancelled" ? "Cancelled" : failed ? `Stopped at ${failed.label}` : run.status} /></div>}
+        {run?.budget && <BudgetMeter budget={run.budget} running={!!running} />}
       </PageHeader>
 
       {failed && failed.message && (

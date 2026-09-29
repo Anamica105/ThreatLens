@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { get, getUserId, patch, setUserId } from "@/lib/api";
 import type { Meta, User, Workspace } from "@/lib/types";
 
@@ -47,6 +47,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const [storedWs, setStoredWs] = useState<string>("all");
+  /** The saved workspace is known once the profile answered (or failed); until then the URL is not rewritten. */
+  const [prefReady, setPrefReady] = useState(false);
+  const chose = useRef(false);
   const urlWs = params.get("ws");
   const ws = urlWs || storedWs;
 
@@ -64,10 +67,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       /* ignore */
     }
     get<Meta>("/api/meta").then(setMeta).catch(() => setMeta(null));
-    get<User>("/api/me").then((u) => {
+    get<User & { preferences?: { workspace?: string } }>("/api/me").then((u) => {
       setUser(u);
       if (!getUserId()) setUserId(u.id);
-    }).catch(() => undefined);
+      // The profile preference follows the hunter across browsers; localStorage is only the fast first guess.
+      const saved = u.preferences?.workspace;
+      if (saved && !chose.current) {
+        setStoredWs(saved);
+        try { localStorage.setItem(WS_KEY, saved); } catch { /* ignore */ }
+      }
+    }).catch(() => undefined).finally(() => setPrefReady(true));
     reloadWorkspaces().catch(() => undefined);
   }, [reloadWorkspaces]);
 
@@ -80,16 +89,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, [theme]);
 
   // Keep ?ws= in the URL so links shared between hunters open in the same context.
+  // The URL wins: the saved preference only fills in when the link has no ?ws=.
   useEffect(() => {
-    if (!urlWs && storedWs && storedWs !== "all") {
+    if (prefReady && !urlWs && storedWs && storedWs !== "all") {
       const p = new URLSearchParams(params.toString());
       p.set("ws", storedWs);
       router.replace(`${pathname}?${p.toString()}`, { scroll: false });
     }
-  }, [urlWs, storedWs, pathname, params, router]);
+  }, [prefReady, urlWs, storedWs, pathname, params, router]);
 
   const setWs = useCallback(
     (id: string) => {
+      chose.current = true;
       setStoredWs(id);
       try {
         localStorage.setItem(WS_KEY, id);
@@ -141,6 +152,8 @@ export function useWsHref() {
   const { ws } = useApp();
   return useCallback((href: string) => {
     if (ws === "all") return href;
-    return href + (href.includes("?") ? "&" : "?") + `ws=${ws}`;
+    const i = href.indexOf("#");
+    const [path, hash] = i < 0 ? [href, ""] : [href.slice(0, i), href.slice(i)];
+    return path + (path.includes("?") ? "&" : "?") + `ws=${ws}` + hash;
   }, [ws]);
 }

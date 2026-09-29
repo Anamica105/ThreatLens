@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { SeenIn } from "@/components/library";
 import { useWsHref } from "@/components/providers";
 import { TacticRail } from "@/components/research/tactic-rail";
+import { SourceTrail } from "@/components/research/provenance";
 import { AttackChip, Badge, Chip } from "@/components/ui/badges";
 import { Button } from "@/components/ui/button";
 import { ErrorState, Skeleton, useToast } from "@/components/ui/feedback";
@@ -16,13 +17,14 @@ import { Dialog } from "@/components/ui/overlay";
 import { patch } from "@/lib/api";
 import { utc } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
-import type { ResearchStatus, Severity, Tactic } from "@/lib/types";
+import type { ProvenanceItem, ResearchStatus, Severity, Tactic } from "@/lib/types";
 
 interface Actor {
   id: string; name: string; aliases: string[]; origin: string; motivation: string[]; target_industries: string[]; target_regions: string[];
   description: string; first_seen: string | null; last_seen: string | null; research_count: number; rail: Tactic[];
   techniques: { id: string; name: string; tactic_ids: string[]; count: number }[]; tools: { id: string; name: string; type: string; count: number }[];
   seen_in: { id: string; title: string; severity: Severity; status: ResearchStatus; created_at: string }[];
+  provenance?: ProvenanceItem[]; provenance_total?: number;
 }
 
 export default function ActorProfile() {
@@ -47,14 +49,15 @@ export default function ActorProfile() {
             {a.techniques.length ? (
               <ul className="flex flex-wrap gap-2">
                 {a.techniques.map((t) => (
-                  <li key={t.id} className="flex items-center gap-1"><AttackChip id={t.id} name={t.name.split(": ").pop()} /><Badge tone={t.count > 1 ? "accent" : "neutral"}>×{t.count}</Badge></li>
+                  <li key={t.id} className="flex max-w-full min-w-0 items-center gap-1"><AttackChip id={t.id} name={t.name.split(": ").pop()} /><Badge tone={t.count > 1 ? "accent" : "neutral"}>×{t.count}</Badge></li>
                 ))}
               </ul>
             ) : <p className="text-fg-muted">No techniques mapped yet.</p>}
           </Panel>
+          <SourceTrail items={a.provenance} total={a.provenance_total} wsHref={wsHref} />
           <SeenIn items={a.seen_in} />
         </div>
-        <aside className="space-y-4">
+        <aside className="min-w-0 space-y-4">
           <Panel title="Details">
             <DefinitionList items={[
               { label: "Origin", value: a.origin || "—" },

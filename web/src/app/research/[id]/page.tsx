@@ -13,6 +13,10 @@ import { ListTab } from "@/components/research/detail/list-tab";
 import { ReportTab } from "@/components/research/detail/report-tab";
 import { StudyTab } from "@/components/research/detail/study-tab";
 import { TreeTab } from "@/components/research/detail/tree-tab";
+import { PathTab } from "@/components/research/detail/path-tab";
+import { groupQueries } from "@/components/research/provenance";
+import { InlineTitle } from "@/components/research/review/editors";
+import { blockingSummary, canReviewEdit, isReviewer as isReviewerRole, ReadinessBadge, ReadinessPanel, type Readiness } from "@/components/research/review/readiness";
 import { Chip, ConfidenceBadge, ResultPill, SeverityBadge, StatusPill, TlpBadge } from "@/components/ui/badges";
 import { Button, ButtonGroup, ButtonLink } from "@/components/ui/button";
 import { Banner, EmptyState, ErrorState, Skeleton, useToast } from "@/components/ui/feedback";
@@ -25,7 +29,7 @@ import { copyText, useApi, useLocalStorage } from "@/lib/hooks";
 import type { ResearchDetail } from "@/lib/types";
 import { FileX } from "lucide-react";
 
-const TABS = ["report", "tree", "list", "study", "hunts", "iocs", "sources", "activity"] as const;
+const TABS = ["report", "path", "tree", "list", "study", "hunts", "iocs", "sources", "activity"] as const;
 type Tab = (typeof TABS)[number];
 
 const EXPORTS = [
@@ -33,6 +37,7 @@ const EXPORTS = [
   { id: "email", label: "Email (HTML)", icon: <Mail /> },
   { id: "pptx", label: "2-slide PPT", icon: <Presentation /> },
   { id: "json", label: "JSON", icon: <FileJson /> },
+  { id: "stix", label: "STIX 2.1 bundle", icon: <FileJson /> },
   { id: "iocs_csv", label: "IoCs CSV", icon: <FileSpreadsheet /> },
   { id: "queries_csv", label: "Queries CSV", icon: <FileSpreadsheet /> },
 ] as const;
@@ -46,7 +51,9 @@ export default function ResearchDetailPage() {
   const wsHref = useWsHref();
   const toast = useToast();
   const { data: d, error, reload: rawReload } = useApi<ResearchDetail>(`/api/research/${id}${ws !== "all" ? `?ws=${ws}` : ""}`);
-  const reload = useCallback(async () => { await rawReload(); }, [rawReload]);
+  // Grounding gate (spec §12). An API without the endpoint (404) simply shows no readiness panel.
+  const { data: readiness, reload: reloadReadiness } = useApi<Readiness>(`/api/research/${id}/readiness`);
+  const reload = useCallback(async () => { await Promise.all([rawReload(), reloadReadiness()]); }, [rawReload, reloadReadiness]);
   const tab = (TABS.includes(params.get("tab") as Tab) ? params.get("tab") : "report") as Tab;
   const [tacticFilter, setTacticFilter] = useState<string | null>(null);
   const [lastExport, setLastExport] = useLocalStorage<string>("tl.lastExport", "pdf");
@@ -63,6 +70,7 @@ export default function ResearchDetailPage() {
     const p = new URLSearchParams(params.toString());
     p.set("tab", t);
     p.delete("done");
+    if (t !== "report") { p.delete("thread"); p.delete("c"); }
     router.replace(`${pathname}?${p.toString()}`, { scroll: false });
   }, [params, pathname, router]);
 
@@ -77,7 +85,7 @@ export default function ResearchDetailPage() {
       const t = e.target as HTMLElement;
       if (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable || e.ctrlKey || e.metaKey || e.altKey) return;
       const n = Number(e.key);
-      if (n >= 1 && n <= 8) setTab(TABS[n - 1]);
+      if (n >= 1 && n <= TABS.length) setTab(TABS[n - 1]);
       if (e.key === "c") {
         const el = document.activeElement?.closest("[data-copy]") as HTMLElement | null;
         if (el?.dataset.copy) { copyText(el.dataset.copy); toast({ tone: "success", message: "Copied" }); }
@@ -119,10 +127,20 @@ export default function ResearchDetailPage() {
   }
 
   const canEdit = d.status !== "archived";
-  const isReviewer = !!user && ["reviewer", "lead", "admin"].includes(user.role);
+  const isReviewer = isReviewerRole(user);
+  const reviewing = ["draft", "in_review", "failed"].includes(d.status);
+  const blocked = !!readiness && readiness.blocking > 0;
+  const jump = (anchor: string) => {
+    if (tab !== "report") setTab("report");
+    setTimeout(() => {
+      const el = document.getElementById(anchor);
+      // Clear the compact header and the sticky tab bar (~170px) so the section heading stays visible.
+      if (el) window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - 180, behavior: "smooth" });
+    }, tab !== "report" ? 250 : 0);
+  };
   const sev = SEVERITY[d.severity] ?? SEVERITY.medium;
   const curResult = ws !== "all" ? d.results.find((r) => r.workspace_id === ws) : null;
-  const counts = { hunts: rec.hunts?.queries?.length ?? 0, iocs: rec.iocs.length, sources: rec.sources.length };
+  const counts = { hunts: rec.hunts?.queries?.length ? groupQueries(rec).length : 0, iocs: rec.iocs.length, sources: rec.sources.length };
 
   const doExport = async (fmt: string, opts?: { hide?: string[]; study?: boolean }) => {
     if (fmt === "email") { setEmailOpen(true); setLastExport("email"); return; }
@@ -150,11 +168,11 @@ export default function ResearchDetailPage() {
 
   const last = EXPORTS.find((e) => e.id === lastExport) ?? EXPORTS[0];
   const primary = d.status === "draft" || d.status === "failed" ? { label: "Submit for review", icon: <Send />, run: () => status("submit") }
-    : d.status === "in_review" ? (isReviewer ? { label: "Publish", icon: <Upload />, run: () => status("publish") } : null)
+    : d.status === "in_review" ? (isReviewer ? { label: "Publish", icon: <Upload />, run: () => status("publish"), disabledReason: blocked ? `${blockingSummary(readiness!)}. Resolve them first.` : undefined } : null)
     : d.status === "archived" ? { label: "Restore", icon: <Undo2 />, run: () => status("restore") } : null;
 
   const tabs = [
-    { id: "report", label: "Report" }, { id: "tree", label: "Tree" }, { id: "list", label: "List" }, { id: "study", label: "Study" },
+    { id: "report", label: "Report" }, { id: "path", label: "Research path" }, { id: "tree", label: "Tree" }, { id: "list", label: "List" }, { id: "study", label: "Study" },
     { id: "hunts", label: "Hunts", count: counts.hunts }, { id: "iocs", label: "IoCs", count: counts.iocs }, { id: "sources", label: "Sources", count: counts.sources },
     { id: "activity", label: "Activity" },
   ];
@@ -170,9 +188,11 @@ export default function ResearchDetailPage() {
           <span className="w-1 shrink-0" style={{ background: sev.solid }} aria-hidden />
           <span className="sr-only">Severity: {sev.label}</span>
           <div className="min-w-0 flex-1 space-y-4 p-5">
-            <h1 className="text-display font-bold tracking-[-0.005em]">{rec.title}</h1>
+            <InlineTitle rid={d.id} title={rec.title} canEdit={canReviewEdit(user, d.status)} onSaved={reload}
+              className="min-w-0 text-display font-bold tracking-[-0.005em] break-words [overflow-wrap:anywhere]" />
             <div className="flex flex-wrap items-center gap-2">
               <StatusPill status={d.status} />
+              {reviewing && <ReadinessBadge r={readiness} onClick={() => document.getElementById("readiness")?.scrollIntoView({ behavior: "smooth", block: "center" })} />}
               <SeverityBadge severity={d.severity} />
               <TlpBadge tlp={d.tlp} />
               <ConfidenceBadge level={d.confidence} />
@@ -205,12 +225,14 @@ export default function ResearchDetailPage() {
                     { label: "Archive", icon: <Archive />, danger: true, onSelect: () => setConfirm("archive"), disabled: d.status === "archived" },
                   ]} trigger={(p) => <Button {...p} aria-label="More export formats" className="!px-2"><ChevronDown /></Button>} />
                 </ButtonGroup>
-                {primary && <Button variant="primary" icon={primary.icon} onClick={primary.run}>{primary.label}</Button>}
+                {primary && <Button variant="primary" icon={primary.icon} onClick={primary.run} disabled={!!primary.disabledReason} disabledReason={primary.disabledReason}>{primary.label}</Button>}
                 {d.status === "in_review" && !isReviewer && <span className="text-caption text-fg-muted">Awaiting reviewer</span>}
               </div>
             </div>
           </div>
         </div>
+
+        {reviewing && readiness && readiness.issues.length > 0 && <ReadinessPanel r={readiness} onJump={jump} className="mt-4" />}
 
         {compact && (
           <div className="fixed top-14 right-0 left-0 z-[100] border-b border-line bg-surface shadow-elev-1 sm:left-16 lg:left-[var(--sb,240px)]">
@@ -218,7 +240,7 @@ export default function ResearchDetailPage() {
               <span className="h-6 w-1 rounded-full" style={{ background: sev.solid }} />
               <span className="min-w-0 flex-1 truncate text-h3 font-semibold">{rec.title}</span>
               <StatusPill status={d.status} />
-              {primary && <Button size="sm" variant="primary" onClick={primary.run}>{primary.label}</Button>}
+              {primary && <Button size="sm" variant="primary" onClick={primary.run} disabled={!!primary.disabledReason} disabledReason={primary.disabledReason}>{primary.label}</Button>}
             </div>
           </div>
         )}
@@ -227,7 +249,8 @@ export default function ResearchDetailPage() {
           <Tabs ariaLabel="Research sections" tabs={tabs} value={tab} onChange={setTab} />
         </div>
         <div id={`panel-${tab}`} role="tabpanel" aria-labelledby={`tab-${tab}`} className="pt-6">
-          {tab === "report" && <ReportTab {...props} tacticFilter={tacticFilter} />}
+          {tab === "report" && <ReportTab {...props} tacticFilter={tacticFilter} readiness={readiness} />}
+          {tab === "path" && <PathTab {...props} />}
           {tab === "tree" && <TreeTab {...props} />}
           {tab === "list" && <ListTab {...props} tacticFilter={tacticFilter} />}
           {tab === "study" && <StudyTab {...props} />}

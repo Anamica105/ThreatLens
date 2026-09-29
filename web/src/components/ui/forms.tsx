@@ -119,8 +119,8 @@ export function Toggle({ checked, onChange, label, disabled }: { checked: boolea
 }
 
 /** Segmented control: 2–4 mutually exclusive options (radio group). */
-export function Segmented<T extends string>({ value, onChange, options, ariaLabel, size = "md" }:
-  { value: T; onChange: (v: T) => void; options: { value: T; label: React.ReactNode; icon?: React.ReactNode }[]; ariaLabel: string; size?: "sm" | "md" }) {
+export function Segmented<T extends string>({ value, onChange, options, ariaLabel, size = "md", className }:
+  { value: T; onChange: (v: T) => void; options: { value: T; label: React.ReactNode; icon?: React.ReactNode }[]; ariaLabel: string; size?: "sm" | "md"; className?: string }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const idx = options.findIndex((o) => o.value === value);
   const onKey = (e: React.KeyboardEvent) => {
@@ -132,11 +132,11 @@ export function Segmented<T extends string>({ value, onChange, options, ariaLabe
   };
   return (
     <div role="radiogroup" aria-label={ariaLabel} onKeyDown={onKey}
-      className={clsx("inline-flex rounded-sm bg-subtle p-[2px]", size === "sm" ? "h-7" : "h-8")}>
+      className={clsx("inline-flex shrink-0 rounded-sm bg-subtle p-[2px]", size === "sm" ? "h-7" : "h-8", className)}>
       {options.map((o, i) => (
         <button key={o.value} ref={(el) => { refs.current[i] = el; }} type="button" role="radio" aria-checked={o.value === value} tabIndex={o.value === value ? 0 : -1}
           onClick={() => onChange(o.value)}
-          className={clsx("inline-flex items-center gap-1.5 rounded-sm px-3 text-[13px] font-semibold transition-colors [&_svg]:size-4",
+          className={clsx("inline-flex items-center gap-1.5 rounded-sm px-3 text-[13px] font-semibold whitespace-nowrap transition-colors [&_svg]:size-4",
             o.value === value ? "border border-line bg-surface text-fg" : "border border-transparent text-fg-muted hover:text-fg")}>
           {o.icon}
           {o.label}

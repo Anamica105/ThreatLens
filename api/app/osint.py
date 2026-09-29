@@ -31,7 +31,89 @@ PROVIDERS = [
     {"id": "urlscan", "name": "urlscan.io", "types": ["url", "domain"], "env": "urlscan_api_key"},
 ]
 CACHE_TTL = timedelta(hours=24)
-EXPIRY_DAYS = {"ipv4": 90, "ipv6": 90, "domain": 180, "url": 90}
+
+# ---------- expiry (spec 9: "Expired: infrastructure IoC older than a configurable age") ----------
+# Age in days per IoC type, counted from the indicator's *intel* first-seen (earliest vendor source publication date,
+# or the earliest first-seen an OSINT provider reports), never from when ThreatLens stored it. None = never expires.
+# Editable in Settings > OSINT (Setting "ioc_expiry_days"). Types not listed never expire.
+EXPIRY_DEFAULTS: dict[str, int | None] = {"ipv4": 90, "ipv6": 90, "domain": 180, "url": 90, "sha256": None, "sha1": None, "md5": None}
+EXPIRY_DAYS = EXPIRY_DEFAULTS  # backwards-compatible name
+EXPIRY_SETTING = "ioc_expiry_days"
+
+
+def get_expiry(db: Session) -> dict[str, int | None]:
+    row = db.get(Setting, EXPIRY_SETTING)
+    stored = (row.value or {}) if row else {}
+    out = dict(EXPIRY_DEFAULTS)
+    for k, v in stored.items():
+        if k in out:
+            out[k] = int(v) if v not in (None, "", 0) else None
+    return out
+
+
+def set_expiry(db: Session, days: dict[str, int | None]) -> dict[str, int | None]:
+    cur = get_expiry(db)
+    for k, v in days.items():
+        if k not in EXPIRY_DEFAULTS:
+            continue
+        if v is not None and (int(v) < 1 or int(v) > 3650):
+            raise ValueError(f"{k}: expiry must be between 1 and 3650 days, or never")
+        cur[k] = int(v) if v else None
+    row = db.get(Setting, EXPIRY_SETTING)
+    if row is None:
+        row = Setting(key=EXPIRY_SETTING, value={})
+        db.add(row)
+    row.value = cur
+    db.flush()
+    return cur
+
+
+def _as_dt(v) -> datetime | None:
+    """Parse the date shapes providers and sources use: epoch seconds, ISO date/datetime strings, datetimes."""
+    if v in (None, "", 0):
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    if isinstance(v, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(v), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    s = str(v).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def intel_first_seen(reputation: dict | None, published: list | None = None) -> datetime | None:
+    """Earliest intel date for an indicator: source publication dates and provider first-seen values (e.g. VT
+    first_submission_date). Future dates are ignored."""
+    cands = [_as_dt(p) for p in (published or [])]
+    for r in (reputation or {}).values():
+        if isinstance(r, dict):
+            cands.append(_as_dt(r.get("first_seen")))
+    now_ = datetime.now(timezone.utc)
+    cands = [c for c in cands if c and c <= now_ + timedelta(days=1)]
+    return min(cands) if cands else None
+
+
+def expires_at(t: str, first_seen: datetime | None, expiry: dict[str, int | None] | None = None) -> datetime | None:
+    days = (expiry or EXPIRY_DEFAULTS).get(t)
+    fs = _as_dt(first_seen)
+    if not days or fs is None:
+        return None
+    return fs + timedelta(days=days)
+
+
+def is_expired(t: str, first_seen: datetime | None, expiry: dict[str, int | None] | None = None,
+               now: datetime | None = None) -> bool:
+    exp = expires_at(t, first_seen, expiry)
+    return bool(exp and (now or datetime.now(timezone.utc)) >= exp)
 
 _last_call: dict[str, float] = {}
 _rate_lock = threading.Lock()
@@ -39,9 +121,9 @@ MIN_INTERVAL = {"virustotal": 15.5, "abuseipdb": 1.0, "greynoise": 1.0, "abusech
 
 
 def get_keys(db: Session) -> dict[str, str]:
-    s = get_settings()
-    stored = (db.get(Setting, "osint_keys") or Setting(value={})).value or {}
-    return {p["id"]: stored.get(p["id"]) or getattr(s, p["env"], "") for p in PROVIDERS}
+    """Decrypted OSINT keys (stored values are encrypted at rest; env vars as fallback)."""
+    from .secrets import get_osint_keys  # local import: secrets imports this module
+    return get_osint_keys(db)
 
 
 def _throttle(provider: str) -> None:
@@ -202,9 +284,11 @@ def enrich(t: str, value: str, keys: dict[str, str]) -> dict:
 
 
 def verdict(t: str, reputation: dict, vendor_named_malicious: bool, vendor_reliability: str | None,
-            first_seen: datetime | None = None) -> str:
-    """Spec 9 verdict logic."""
-    if reputation.get("greynoise", {}).get("benign"):
+            first_seen: datetime | None = None, expiry: dict[str, int | None] | None = None,
+            known_good: bool = False) -> str:
+    """Spec 9 verdict logic. `first_seen` is the intel first-seen (see intel_first_seen); `expiry` the per-type ages
+    (get_expiry); `known_good` = on the well-known tool hash allow-list."""
+    if known_good or reputation.get("greynoise", {}).get("benign"):
         return "benign"
     flags = sum(1 for r in reputation.values() if isinstance(r, dict) and r.get("flagged"))
     reliable_vendor = vendor_named_malicious and (vendor_reliability or "C")[0] in "AB"
@@ -214,11 +298,8 @@ def verdict(t: str, reputation: dict, vendor_named_malicious: bool, vendor_relia
         v = "suspicious"
     else:
         v = "unknown"
-    days = EXPIRY_DAYS.get(t)
-    if days and first_seen and v != "benign":
-        fs = first_seen if first_seen.tzinfo else first_seen.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) - fs > timedelta(days=days):
-            return "expired"
+    if first_seen and is_expired(t, first_seen, expiry):
+        return "expired"
     return v
 
 

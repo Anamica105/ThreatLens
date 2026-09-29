@@ -20,7 +20,7 @@ export function WorkspaceSwitcher() {
   return (
     <Popover align="start" width={320} label="Switch workspace" onOpenChange={(o) => { if (o) { setQ(""); setCursor(0); } }}
       trigger={(p) => (
-        <button {...p} className="flex h-10 min-w-0 items-center gap-2 rounded-sm px-2 text-left hover:bg-subtle" aria-label={`Workspace: ${activeWorkspace?.name ?? "All workspaces"}. Switch workspace`}>
+        <button {...p} className="flex h-10 max-w-full min-w-0 items-center gap-2 rounded-sm px-2 text-left hover:bg-subtle" aria-label={`Workspace: ${activeWorkspace?.name ?? "All workspaces"}. Switch workspace`}>
           <span className="size-2 shrink-0 rounded-full" style={{ background: activeWorkspace?.color ?? "var(--g-400)" }} />
           <span className="min-w-0">
             <span className="block max-w-[180px] truncate text-[14px] leading-4 font-semibold">{activeWorkspace?.name ?? "All workspaces"}</span>

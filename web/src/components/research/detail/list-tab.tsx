@@ -1,107 +1,172 @@
 "use client";
 
 import clsx from "clsx";
-import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
-import { useMemo, useState } from "react";
-import { CLASSIFICATION } from "@/lib/constants";
-import { useApp } from "../../providers";
+import { ChevronRight, ChevronsDownUp, ChevronsUpDown, Network, PanelRight, Search } from "lucide-react";
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { QUERY_STATUS, QUERY_STATUS_ORDER } from "@/lib/constants";
+import { useApp, useWsHref } from "../../providers";
 import { QueryStatusPill } from "../../ui/badges";
 import { Button, ButtonGroup } from "../../ui/button";
-import { Select } from "../../ui/forms";
+import { Input, Select } from "../../ui/forms";
+import { NodeDrawer, nodeColor } from "../tree/details";
+import { CLASS_META, branchIds, buildResearchTree, defaultExpanded, descendantCounts, filterTree, findPath, levelCounts, type ClassKey, type TNode } from "../tree/model";
 import type { DetailProps } from "./common";
 
-interface Row { id: string; level: number; kind: "ttp" | "behaviour" | "opportunity" | "detection"; label: React.ReactNode; meta?: React.ReactNode; right?: React.ReactNode; parent?: string; hasKids: boolean; tactic?: string }
+const KIND_CHIP: Record<TNode["kind"], string> = { subject: "Subject", class: "Class", behaviour: "Behaviour", opportunity: "DO", detection: "Detection" };
 
-/** Expandable list view: the non-visual equivalent of the tree (design.md 15.5). */
-export function ListTab({ d, tacticFilter }: DetailProps & { tacticFilter: string | null }) {
+interface Row { n: TNode; level: number; parent: string | null; setsize: number; posinset: number }
+
+/** List view (spec §7.3): the tree's hierarchy as a nested, expandable ARIA treegrid with counts and filters. */
+export function ListTab({ d, canEdit, tacticFilter }: DetailProps & { tacticFilter: string | null }) {
   const { platformName } = useApp();
+  const wsHref = useWsHref();
   const rec = d.record;
-  const [open, setOpen] = useState<Set<string>>(new Set());
-  const [tactic, setTactic] = useState<string>(tacticFilter ?? "");
+  const full = useMemo(() => buildResearchTree(d, (p) => platformName(p, true)), [d, platformName]);
+  const [cls, setCls] = useState("");
+  const [tactic, setTactic] = useState(tacticFilter ?? "");
+  const [platform, setPlatform] = useState("");
+  const [status, setStatus] = useState("");
+  const [text, setText] = useState("");
+  const [open, setOpen] = useState<Set<string>>(() => defaultExpanded(full));
+  const [focus, setFocus] = useState("root");
+  const [selected, setSelected] = useState<string | null>(null);
+  const grid = useRef<HTMLDivElement | null>(null);
 
+  useEffect(() => { if (tacticFilter !== null) setTactic(tacticFilter); }, [tacticFilter]);
+
+  const filters = { cls, tactic, platform, status, text };
+  const filtering = !!(tactic || platform || status || text.trim());
+  const root = useMemo(() => filterTree(full, { cls, tactic, platform, status, text }), [full, cls, tactic, platform, status, text]);
+  // A filter that looks below level 3 opens every matching branch so the matches are visible.
+  useEffect(() => { setOpen(filtering ? new Set(branchIds(root)) : defaultExpanded(root)); }, [root, filtering]);
+
+  const counts = useMemo(() => levelCounts(root), [root]);
   const rows = useMemo(() => {
     const out: Row[] = [];
-    const steps = rec.attack_paths.flatMap((p) => p.steps);
-    const seen = new Set<string>();
-    for (const m of rec.mitre) {
-      if (seen.has(m.technique_id)) continue;
-      seen.add(m.technique_id);
-      if (tactic && m.tactic_id !== tactic) continue;
-      const bs = steps.filter((s) => s.technique_id === m.technique_id);
-      const opps = rec.detection_opportunities.filter((o) => bs.some((b) => b.ref === o.behaviour_ref) || (!bs.length && o.techniques.includes(m.technique_id)));
-      const nDet = opps.reduce((a, o) => a + rec.hunts.queries.filter((q) => q.opportunity_id === o.id).length, 0);
-      const tid = `t-${m.technique_id}`;
-      out.push({ id: tid, level: 0, kind: "ttp", hasKids: bs.length > 0, tactic: m.tactic_id,
-        label: <><span className="font-mono text-mono text-accent-text">{m.technique_id}</span> <span>{m.sub_technique || m.technique}</span></>,
-        meta: `${m.tactic} · ${bs.length} behaviour${bs.length === 1 ? "" : "s"} · ${nDet} detection${nDet === 1 ? "" : "s"}` });
-      for (const b of bs) {
-        const bo = rec.detection_opportunities.filter((o) => o.behaviour_ref === b.ref);
-        const bid = `${tid}/b-${b.ref}`;
-        out.push({ id: bid, parent: tid, level: 1, kind: "behaviour", hasKids: bo.length > 0, label: b.behaviour,
-          meta: `${bo.length} detection opportunit${bo.length === 1 ? "y" : "ies"}`, right: <span className="font-mono text-mono-sm text-fg-muted">{b.ref}</span> });
-        for (const o of bo) {
-          const qs = rec.hunts.queries.filter((q) => q.opportunity_id === o.id);
-          const oid = `${bid}/o-${o.id}`;
-          out.push({ id: oid, parent: bid, level: 2, kind: "opportunity", hasKids: qs.length > 0,
-            label: <><span className="font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{o.id}</span> {o.title}</>,
-            meta: o.logic });
-          out.push({ id: `${oid}/q`, parent: oid, level: 3, kind: "detection", hasKids: false,
-            label: <span className="flex flex-wrap items-center gap-x-2">{qs.map((q, i) => <span key={q.id}>{i > 0 && <span className="text-fg-faint">· </span>}{platformName(q.platform, true)}</span>)}</span>,
-            right: qs.length ? <QueryStatusPill status={qs.find((q) => q.platform !== "sigma")?.status ?? qs[0].status} /> : null });
-        }
-      }
-    }
+    const walk = (n: TNode, level: number, parent: string | null, setsize: number, posinset: number) => {
+      out.push({ n, level, parent, setsize, posinset });
+      if (open.has(n.id)) n.children.forEach((c, i) => walk(c, level + 1, n.id, n.children.length, i + 1));
+    };
+    walk(root, 0, null, 1, 1);
     return out;
-  }, [rec, tactic, platformName]);
+  }, [root, open]);
 
-  const visible = rows.filter((r) => {
-    let p = r.parent;
-    while (p) {
-      if (!open.has(p)) return false;
-      p = rows.find((x) => x.id === p)?.parent;
-    }
-    return true;
-  });
   const toggle = (id: string) => setOpen((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
-  const kindLabel = { ttp: ["TTP", CLASSIFICATION.ttp.color], behaviour: ["Behaviour", CLASSIFICATION.behaviour.color], opportunity: ["DO", CLASSIFICATION.opportunity.color], detection: ["Detections", CLASSIFICATION.detection.color] } as const;
+  const focusRow = (id: string) => {
+    setFocus(id);
+    requestAnimationFrame(() => grid.current?.querySelector<HTMLElement>(`[data-row="${CSS.escape(id)}"]`)?.focus());
+  };
+  const onKey = (e: React.KeyboardEvent, r: Row, i: number) => {
+    const has = r.n.children.length > 0;
+    if (e.key === "ArrowDown" && rows[i + 1]) focusRow(rows[i + 1].n.id);
+    else if (e.key === "ArrowUp" && rows[i - 1]) focusRow(rows[i - 1].n.id);
+    else if (e.key === "ArrowRight") { if (has && !open.has(r.n.id)) toggle(r.n.id); else if (has) focusRow(r.n.children[0].id); }
+    else if (e.key === "ArrowLeft") { if (has && open.has(r.n.id)) toggle(r.n.id); else if (r.parent) focusRow(r.parent); }
+    else if (e.key === "Home") focusRow(rows[0].n.id);
+    else if (e.key === "End") focusRow(rows[rows.length - 1].n.id);
+    else if (e.key === " ") { if (has) toggle(r.n.id); }
+    else if (e.key === "Enter") setSelected(r.n.id);
+    else return;
+    e.preventDefault();
+  };
+
   const tactics = Array.from(new Map(rec.mitre.map((m) => [m.tactic_id, m.tactic])).entries());
+  const platforms = Array.from(new Set(rec.hunts.queries.map((q) => q.platform)));
+  const statuses = QUERY_STATUS_ORDER.filter((s) => rec.hunts.queries.some((q) => q.status === s));
+  const selNode = selected ? findPath(root, selected) : [];
+  const sel = selNode[selNode.length - 1] ?? null;
+  const clear = () => { setCls(""); setTactic(""); setPlatform(""); setStatus(""); setText(""); };
+  const anyFilter = Object.values(filters).some(Boolean);
 
   return (
     <div>
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <ButtonGroup>
-          <Button size="sm" icon={<ChevronsUpDown />} onClick={() => setOpen(new Set(rows.filter((r) => r.hasKids).map((r) => r.id)))}>Expand all</Button>
-          <Button size="sm" icon={<ChevronsDownUp />} onClick={() => setOpen(new Set())}>Collapse all</Button>
+          <Button size="sm" icon={<ChevronsUpDown />} onClick={() => setOpen(new Set(branchIds(root)))}>Expand all</Button>
+          <Button size="sm" icon={<ChevronsDownUp />} onClick={() => setOpen(defaultExpanded(root))}>Collapse to level 3</Button>
         </ButtonGroup>
-        <Select size="sm" className="w-56" value={tactic} onChange={setTactic} ariaLabel="Filter by tactic"
+        <Input inputSize="sm" className="w-full sm:w-56" prefixIcon={<Search />} placeholder="Filter by text" value={text} onChange={(e) => setText(e.target.value)} aria-label="Filter rows by text" />
+        <Link href={wsHref("?tab=tree")} className="ml-auto inline-flex h-7 items-center gap-1.5 rounded-sm px-2 text-[13px] font-semibold text-accent-text hover:bg-accent-soft"><Network className="size-4" />Tree view</Link>
+      </div>
+      <div className="mb-3 grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
+        <Select size="sm" className="sm:w-44" value={cls} onChange={setCls} ariaLabel="Filter by classification"
+          options={[{ value: "", label: "All classifications" }, ...full.children.map((c) => ({ value: c.cls, label: CLASS_META[c.cls as ClassKey]?.label ?? c.label }))]} />
+        <Select size="sm" className="sm:w-48" value={tactic} onChange={setTactic} ariaLabel="Filter by tactic"
           options={[{ value: "", label: "All tactics" }, ...tactics.map(([id, name]) => ({ value: id, label: name }))]} />
-        <span className="ml-auto text-caption text-fg-muted">{rows.filter((r) => r.kind === "ttp").length} techniques · {rec.detection_opportunities.length} detection opportunities · {rec.hunts.queries.length} queries</span>
+        <Select size="sm" className="sm:w-44" value={platform} onChange={setPlatform} ariaLabel="Filter by platform"
+          options={[{ value: "", label: "All platforms" }, ...platforms.map((p) => ({ value: p, label: platformName(p) }))]} />
+        <Select size="sm" className="sm:w-44" value={status} onChange={setStatus} ariaLabel="Filter by detection status"
+          options={[{ value: "", label: "Any detection status" }, ...statuses.map((s) => ({ value: s, label: QUERY_STATUS[s]?.label ?? s }))]} />
+        {anyFilter && <Button size="sm" variant="tertiary" onClick={clear}>Clear filters</Button>}
       </div>
-      <div role="treegrid" aria-label="Research hierarchy" className="overflow-hidden rounded-md border border-line bg-surface">
-        {visible.map((r) => (
-          <div key={r.id} role="row" aria-level={r.level + 1} aria-expanded={r.hasKids ? open.has(r.id) : undefined}
-            className="flex min-h-9 items-start gap-2 border-b border-line py-2 pr-4 last:border-0 hover:bg-[var(--g-25)] dark:hover:bg-subtle"
-            style={{ paddingLeft: 12 + r.level * 20 }}>
-            {r.level > 0 && <span className="-ml-3 w-px self-stretch bg-[var(--border-subtle)]" aria-hidden />}
-            {r.hasKids ? (
-              <button onClick={() => toggle(r.id)} aria-label={open.has(r.id) ? "Collapse" : "Expand"}
-                onKeyDown={(e) => { if (e.key === "ArrowRight" && !open.has(r.id)) toggle(r.id); if (e.key === "ArrowLeft" && open.has(r.id)) toggle(r.id); }}
-                className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-sm text-fg-muted hover:bg-subtle">
-                <ChevronRight className={clsx("size-4 transition-transform duration-[var(--motion-base)]", open.has(r.id) && "rotate-90")} />
-              </button>
-            ) : <span className="w-5 shrink-0" />}
-            <span className="mt-0.5 inline-flex h-5 shrink-0 items-center gap-1.5 rounded-sm bg-chip px-1.5 text-[11px] font-semibold text-chip-fg">
-              <span className="size-1.5 rounded-full" style={{ background: kindLabel[r.kind][1] }} />{kindLabel[r.kind][0]}
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className={clsx("text-[14px]", r.kind === "behaviour" && "font-mono text-mono")}>{r.label}</div>
-              {r.meta && <div className="text-caption text-fg-muted">{r.meta}</div>}
+      <p className="mb-2 text-caption text-fg-muted tabular" aria-live="polite">
+        {counts.classes} classifications · {counts.behaviours} attack behaviours · {counts.opportunities} detection opportunities · {counts.detections} detections
+      </p>
+
+      <div ref={grid} role="treegrid" aria-label="Research hierarchy" aria-readonly className="overflow-hidden rounded-md border border-line bg-surface">
+        <div role="row" className="hidden border-b border-line bg-subtle px-3 py-1.5 text-caption font-semibold text-fg-muted sm:flex">
+          <span role="columnheader" className="flex-1">Name</span>
+          <span role="columnheader" className="w-60 text-right">Below this level</span>
+          <span role="columnheader" className="w-24 text-right"><span className="sr-only">Details</span></span>
+        </div>
+        {rows.map((r, i) => {
+          const n = r.n;
+          const has = n.children.length > 0;
+          const isOpen = open.has(n.id);
+          const c = has ? descendantCounts(n) : null;
+          const q = n.ref.t === "query" ? n.ref.query : null;
+          return (
+            <div key={n.id} role="row" data-row={n.id} aria-level={r.level + 1} aria-setsize={r.setsize} aria-posinset={r.posinset}
+              aria-expanded={has ? isOpen : undefined} aria-selected={selected === n.id} tabIndex={focus === n.id ? 0 : -1}
+              onKeyDown={(e) => onKey(e, r, i)} onFocus={() => setFocus(n.id)}
+              className={clsx("flex flex-wrap items-start gap-x-2 gap-y-1 border-b border-line py-2 pr-3 last:border-0 outline-none hover:bg-[var(--g-25)] focus-visible:bg-accent-soft dark:hover:bg-subtle",
+                n.kind === "class" && "bg-[var(--g-25)] dark:bg-subtle")}
+              style={{ paddingLeft: 8 + Math.min(r.level, 4) * 18 }}>
+              <div role="gridcell" className="flex min-w-0 flex-[1_1_16rem] items-start gap-2">
+                {has ? (
+                  <button tabIndex={-1} onClick={() => { toggle(n.id); setFocus(n.id); }} aria-label={isOpen ? `Collapse ${n.label}` : `Expand ${n.label}`}
+                    className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-sm text-fg-muted hover:bg-subtle">
+                    <ChevronRight className={clsx("size-4 transition-transform duration-[var(--motion-base)]", isOpen && "rotate-90")} />
+                  </button>
+                ) : <span className="w-5 shrink-0" />}
+                <span className="mt-0.5 inline-flex h-5 shrink-0 items-center gap-1.5 rounded-sm bg-chip px-1.5 text-[11px] font-semibold text-chip-fg">
+                  <span className="size-1.5 rounded-full" style={{ background: nodeColor(n) }} />{KIND_CHIP[n.kind]}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <button tabIndex={-1} onClick={() => { if (has) toggle(n.id); else setSelected(n.id); setFocus(n.id); }}
+                    className={clsx("text-left text-[14px] break-words [overflow-wrap:anywhere] hover:underline", n.kind === "class" && "font-semibold", n.kind === "subject" && "font-semibold")}>
+                    {n.tag && n.kind === "behaviour" && <span className="mr-1.5 font-mono text-mono-sm text-accent-text">{n.tag}</span>}
+                    {n.kind === "opportunity" && n.sub && <span className="mr-1.5 font-mono text-mono-sm font-semibold" style={{ color: "var(--cls-opportunity)" }}>{n.sub}</span>}
+                    {n.label}
+                  </button>
+                  <div className="text-caption text-fg-muted break-words [overflow-wrap:anywhere]">
+                    {n.kind === "class" && n.sub}
+                    {n.kind === "subject" && n.sub}
+                    {n.kind === "behaviour" && [n.sub, n.context].filter(Boolean).join(" · ")}
+                    {n.kind === "opportunity" && (n.ref.t === "opp" ? n.ref.opp.logic : n.ref.t === "group" ? `${n.ref.group.queries.length} platform queries` : "")}
+                    {q && q.title}
+                  </div>
+                </div>
+              </div>
+              <div role="gridcell" className="flex min-w-0 items-center gap-2 pl-7 text-caption text-fg-muted tabular sm:w-60 sm:justify-end sm:pl-0">
+                {c && [n.kind === "subject" || n.kind === "class" ? `${c.behaviours} beh.` : "", n.kind !== "opportunity" ? `${c.opportunities} DO` : "", `${c.detections} det.`].filter(Boolean).join(" · ")}
+                {!has && n.kind === "behaviour" && <span className="text-fg-faint">No detection yet</span>}
+                {q && <QueryStatusPill status={q.status} />}
+              </div>
+              <div role="gridcell" className="flex w-auto justify-end sm:w-24">
+                <Button size="sm" variant="tertiary" icon={<PanelRight />} tabIndex={-1} onClick={() => { setSelected(n.id); setFocus(n.id); }} aria-label={`Details: ${n.label}`}>
+                  {q ? "Query" : "Details"}
+                </Button>
+              </div>
             </div>
-            {r.right}
-          </div>
-        ))}
-        {!visible.length && <p className="p-6 text-center text-fg-muted">No techniques mapped{tactic ? " for this tactic" : ""}.</p>}
+          );
+        })}
+        {root.children.length === 0 && <p className="p-6 text-center text-fg-muted">Nothing matches these filters.</p>}
       </div>
+
+      <NodeDrawer node={sel} siblings={selNode[selNode.length - 2]?.children ?? []} rec={rec} canEdit={canEdit}
+        onSelect={(n) => setSelected(n.id)} onClose={() => { setSelected(null); if (focus) focusRow(focus); }} />
     </div>
   );
 }

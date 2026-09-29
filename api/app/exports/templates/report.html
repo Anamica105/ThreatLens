@@ -170,9 +170,11 @@
 {% if sections.queries and queries %}
 <section class="appendix">
 <h2>Appendix B — Hunt queries</h2>
+{% if mapping_workspace %}<p class="muted">Field mappings for {{ mapping_workspace }} applied (index, sourcetype, table and field names); queries are copy-paste ready for this workspace.</p>{% endif %}
 {% for q in queries %}
 <h4><span class="mono">{{ q.id }}</span> · {{ platform_name(q.platform) }} · {{ qtype[q.type] }} — {{ q.title }}</h4>
 <pre>{{ q.body }}</pre>
+{% if q.lint %}<p class="muted" style="font-size:8.5pt">Lint: {{ q.lint|join('; ') }}</p>{% endif %}
 {% if q.log_sources %}<p class="muted" style="font-size:8.5pt">Requires: {{ q.log_sources|join(', ') }}{% if q.fp_notes %} · False positives: {{ q.fp_notes }}{% endif %}</p>{% endif %}
 {% endfor %}
 </section>

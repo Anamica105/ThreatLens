@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import type { ResearchDetail, Source } from "@/lib/types";
+import { useWsHref } from "../../providers";
 import { Tooltip } from "../../ui/overlay";
 
 export interface DetailProps {
@@ -12,14 +13,21 @@ export interface DetailProps {
   ws: string;
 }
 
+/** In-page link (e.g. `?tab=hunts`) that keeps the active `?ws=` workspace. */
+export function WsLink({ href, ...props }: React.ComponentProps<typeof Link> & { href: string }) {
+  const wsHref = useWsHref();
+  return <Link href={wsHref(href)} {...props} />;
+}
+
 /** Superscript source links; each jumps to its source card. */
 export function SourceRefs({ ids, sources }: { ids: string[]; sources: Record<string, Source> }) {
+  const wsHref = useWsHref();
   if (!ids?.length) return <sup className="ml-0.5 text-[11px] font-semibold text-danger" title="No supporting source">unsupported</sup>;
   return (
     <sup className="ml-0.5 space-x-0.5 text-[11px]">
       {ids.map((id) => (
         <Tooltip key={id} content={sources[id] ? `${sources[id].publisher} — ${sources[id].title}` : id}>
-          <Link href={`?tab=sources#source-${id}`} className="font-mono font-semibold text-accent-text hover:underline">{id.replace("S", "")}</Link>
+          <Link href={wsHref(`?tab=sources#source-${id}`)} className="font-mono font-semibold text-accent-text hover:underline">{id.replace("S", "")}</Link>
         </Tooltip>
       ))}
     </sup>

@@ -8,12 +8,15 @@ Check Point Research. Fetchers never submit forms or log in.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import ipaddress
 import logging
 import re
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import feedparser
 import httpx
@@ -79,6 +82,21 @@ def _score(text: str, kws: list[tuple[str, int]]) -> int:
     return sum(w for k, w in kws if re.search(rf"(?<![\w-]){re.escape(k.lower())}(?![\w-])", t))
 
 
+def pull_feeds(vendors: list[dict]) -> list[tuple[dict, object, Exception | None]]:
+    """Fetch and parse each vendor's RSS feed in parallel: [(vendor, parsed feed or None, error or None)]."""
+    def pull(v: dict):
+        try:
+            with guarded_client(12) as client:
+                r, _ = guarded_get(client, v["feed"])
+                r.raise_for_status()
+                return v, feedparser.parse(r.content), None
+        except Exception as e:  # noqa: BLE001 - one bad feed must not stop discovery
+            return v, None, e
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(pull, [v for v in vendors if v["feed"]]))
+
+
 MIN_FEED_SCORE = 3  # one CVE or actor, or several weaker terms together
 
 
@@ -97,18 +115,7 @@ def discover(entities: dict, seed_urls: list[str], vendor_ids: list[str] | None,
 
     enabled = [v for v in VENDORS if (not vendor_ids or v["id"] in vendor_ids) and v["feed"]]
     if kws:
-        def pull(v: dict):
-            try:
-                with httpx.Client(timeout=12, headers={"User-Agent": UA}, follow_redirects=True) as client:
-                    r = client.get(v["feed"])
-                    r.raise_for_status()
-                    return v, feedparser.parse(r.content), None
-            except Exception as e:  # noqa: BLE001 - one bad feed must not stop discovery
-                return v, None, e
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            pulled = list(ex.map(pull, enabled))
-        for v, feed, err in pulled:
+        for v, feed, err in pull_feeds(enabled):
             if err is not None or feed is None:
                 logf(f"{v['name']} feed unavailable ({type(err).__name__})", "warn")
                 continue
@@ -182,19 +189,140 @@ def discover(entities: dict, seed_urls: list[str], vendor_ids: list[str] | None,
     return out[:limit]
 
 
-def _playwright_text(url: str) -> tuple[str, str]:
-    from playwright.sync_api import sync_playwright  # optional dependency
+class BlockedAddress(httpx.RequestError):
+    pass
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page(user_agent=UA)
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            html = page.content()
-            title = page.title()
-        finally:
-            browser.close()
-    return html, title
+
+def _public_ip(url: str) -> str | None:
+    """SSRF guard: the one address to connect to for an http(s) URL, or None unless its host resolves exclusively to
+    public (globally routable) addresses. Seed URLs come from users and inbound email, so without this a fetch could
+    reach cloud metadata or internal services."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return None
+        infos = socket.getaddrinfo(p.hostname, p.port or (443 if p.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except (ValueError, OSError):
+        return None
+    first = None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            return None
+        first = first or str(ip)
+    return first
+
+
+def is_public_url(url: str) -> bool:
+    return _public_ip(url) is not None
+
+
+_HOP_HEADERS = {"host", "connection", "keep-alive", "transfer-encoding", "te", "upgrade", "proxy-authorization",
+                "proxy-connection", "content-length"}
+
+
+def _pin(url: str, headers: dict | None) -> tuple[str, dict, dict]:
+    """(target URL with the checked IP as host, headers with the real Host, request extensions with the TLS SNI name)."""
+    ip = _public_ip(url)
+    if ip is None:
+        raise BlockedAddress(f"Blocked non-public address {urlparse(url).hostname}")
+    p = urlparse(url)
+    host_ip = f"[{ip}]" if ":" in ip else ip
+    port = f":{p.port}" if p.port else ""
+    target = urlunparse(p._replace(netloc=host_ip + port))
+    hdrs = {k: v for k, v in (headers or {}).items() if k.lower() not in _HOP_HEADERS}
+    hdrs["Host"] = p.hostname + port
+    return target, hdrs, ({"sni_hostname": p.hostname} if p.scheme == "https" else {})
+
+
+def pinned_request(client: httpx.Client, method: str, url: str, headers: dict | None = None,
+                   content: bytes | None = None) -> httpx.Response:
+    """One request (no redirects) sent to the address that passed the SSRF check, not to a second DNS answer: the URL
+    host is swapped for the checked IP and the name goes in the Host header and TLS SNI, so certificates are still
+    verified against the real hostname. This closes the check-then-resolve-again (DNS rebinding) gap."""
+    target, hdrs, ext = _pin(url, headers)
+    return client.request(method, target, headers=hdrs, content=content, extensions=ext, follow_redirects=False)
+
+
+async def pinned_request_async(client: httpx.AsyncClient, method: str, url: str, headers: dict | None = None,
+                               content: bytes | None = None) -> httpx.Response:
+    target, hdrs, ext = await asyncio.to_thread(_pin, url, headers)  # getaddrinfo blocks
+    return await client.request(method, target, headers=hdrs, content=content, extensions=ext, follow_redirects=False)
+
+
+def guarded_get(client: httpx.Client, url: str, max_redirects: int = 5) -> tuple[httpx.Response, str]:
+    """GET following redirects by hand, every hop checked and pinned. Returns (response, final URL)."""
+    for _ in range(max_redirects + 1):
+        r = pinned_request(client, "GET", url)
+        if r.is_redirect and r.headers.get("location"):
+            url = urljoin(url, r.headers["location"])
+            continue
+        return r, url
+    raise httpx.TooManyRedirects(f"More than {max_redirects} redirects", request=r.request)
+
+
+# trust_env=False: an environment proxy would do its own DNS lookup and bypass the pinning.
+def guarded_client(timeout: float) -> httpx.Client:
+    return httpx.Client(timeout=timeout, headers={"User-Agent": UA}, follow_redirects=False, trust_env=False)
+
+
+def _guarded_async_client(timeout: float) -> httpx.AsyncClient:
+    # Short connect timeout: pages pull in trackers and CDNs that may be unreachable, and each would hold "networkidle".
+    return httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)), headers={"User-Agent": UA}, follow_redirects=False, trust_env=False)
+
+
+TEXT_ONLY_SKIP = frozenset({"image", "media", "font", "stylesheet"})  # not needed to extract article text
+_WIRE_HEADERS = ("content-encoding", "content-length", "transfer-encoding")  # httpx already decoded the body
+
+
+def run_guarded_page(work, *, user_agent: str | None = None, skip_types: frozenset[str] = frozenset(),
+                     timeout: float = 30.0):
+    """Run `await work(page)` in headless Chromium that fetches nothing itself: every request is replayed through
+    `pinned_request_async` (concurrently) and the response handed back, so Chromium never resolves or connects to a
+    host on its own. Service workers are blocked (they bypass routing) and WebSockets are closed.
+    Call from a thread without a running event loop (pipeline workers, sync FastAPI endpoints)."""
+    async def main():
+        from playwright.async_api import async_playwright  # optional dependency
+
+        async with async_playwright() as p, _guarded_async_client(timeout) as client:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await (await browser.new_context(user_agent=user_agent, service_workers="block")).new_page()
+
+                async def handle(route):
+                    req = route.request
+                    if req.url.startswith("data:"):
+                        return await route.continue_()
+                    if req.resource_type in skip_types:
+                        return await route.abort()
+                    try:
+                        r = await pinned_request_async(client, req.method, req.url, headers=req.headers,
+                                                       content=req.post_data_buffer)
+                    except Exception:  # noqa: BLE001 - blocked address or network error: the page misses that resource
+                        return await route.abort()
+                    await route.fulfill(status=r.status_code, body=r.content,
+                                        headers={k: v for k, v in r.headers.items() if k.lower() not in _WIRE_HEADERS})
+
+                async def close_ws(ws):
+                    await ws.close()
+
+                await page.route("**/*", handle)
+                await page.route_web_socket("**/*", close_ws)
+                return await work(page)
+            finally:
+                await browser.close()
+
+    return asyncio.run(main())
+
+
+def _playwright_text(url: str) -> tuple[str, str]:
+    async def work(page):
+        await page.goto(url, wait_until="networkidle", timeout=45000)
+        return await page.content(), await page.title()
+
+    return run_guarded_page(work, user_agent=UA, skip_types=TEXT_ONLY_SKIP, timeout=get_settings().fetch_timeout)
 
 
 _ERROR_MARKERS = re.compile(
@@ -215,9 +343,13 @@ def relevance(text: str, entities: dict) -> int:
 def fetch(url: str, logf=lambda m, level="info": None) -> dict:
     """Fetch an article and extract its main text. Returns {text, title, published, last_modified, content_hash, method}."""
     html, title, last_modified, method = "", "", None, "httpx"
+    if not is_public_url(url):
+        logf(f"Skipped {url}: not a public http(s) address", "warn")
+        return {"text": "", "title": "", "published": None, "last_modified": None,
+                "content_hash": "", "method": method}
     try:
-        with httpx.Client(timeout=get_settings().fetch_timeout, headers={"User-Agent": UA}, follow_redirects=True) as client:
-            r = client.get(url)
+        with guarded_client(get_settings().fetch_timeout) as client:
+            r, _ = guarded_get(client, url)
             r.raise_for_status()
             # Decode from the declared charset, else UTF-8 (httpx's fallback guesses mangle many vendor blogs).
             # Try strict UTF-8 first: many servers send a wrong ISO-8859-1 header for UTF-8 pages.

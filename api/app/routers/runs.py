@@ -42,7 +42,13 @@ def get_run(run_id: str, after_log: int = 0, db: Session = Depends(get_db)):
         "stages": [{"id": sid, "label": label, **(run.stage_status or {}).get(sid, {"state": "pending"})} for sid, label in runner.STAGES],
         "logs": [{"id": x.id, "stage": x.stage, "level": x.level, "message": x.message, "created_at": iso(x.created_at)} for x in logs],
         "sources": sources,
+        "budget": runner.run_budget(run),
     }
+
+
+@router.get("/{run_id}/budget")
+def get_budget(run_id: str, db: Session = Depends(get_db)):
+    return runner.run_budget(_run(db, run_id))
 
 
 class RetryIn(BaseModel):

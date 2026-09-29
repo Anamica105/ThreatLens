@@ -72,7 +72,7 @@ export default function DashboardPage() {
             <KpiTile label="Queries generated" value={num(data.kpis.queries, true)} tooltip={num(data.kpis.queries)} delta={delta(data.kpis.queries, data.previous.queries)} onClick={() => router.push(wsHref("/library/queries"))} />
           </div>
 
-          <div className="grid gap-6 lg:grid-cols-2">
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
             <Panel title="Research over time"><RunsLine data={data.runs_over_time} onPoint={() => lib("")} /></Panel>
             <Panel title="Results by status">
               <CategoryBars unit="hunt results" onBar={(k) => lib(`&result=${k}`)}
@@ -81,7 +81,7 @@ export default function DashboardPage() {
             </Panel>
           </div>
 
-          <div className="grid gap-6 lg:grid-cols-[1fr_2fr]">
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
             <Panel title="Severity mix">
               <CategoryBars onBar={(k) => lib(`&severity=${k}`)}
                 data={data.severity_mix.map((s) => ({ key: s.severity, label: SEVERITY[s.severity].label, count: s.count, color: SEVERITY[s.severity].solid }))} />
@@ -91,27 +91,29 @@ export default function DashboardPage() {
             </Panel>
           </div>
 
-          <div className="grid gap-6 lg:grid-cols-3">
+          <div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] xl:grid-cols-[repeat(3,minmax(0,1fr))]">
             <Panel title="Top actors">
               <RankedList items={data.top_actors.map((a) => ({ key: a.name, label: a.name, count: a.count }))} onItem={(k) => lib(`&actor=${encodeURIComponent(k)}`)} />
             </Panel>
             <Panel title="Top CVEs">
               <RankedList items={data.top_cves.map((c) => ({ key: c.cve, label: c.cve, count: c.count, mono: true }))} onItem={(k) => lib(`&cve=${k}`)} />
             </Panel>
-            <Panel title="By workspace" bodyClassName="!p-0">
+            <Panel title="By workspace" bodyClassName="!p-0" className="md:col-span-2 xl:col-span-1">
+              <div className="overflow-x-auto">
               <table className="tl-table tl-compact w-full">
                 <thead><tr><th>Workspace</th><th className="num">Runs</th><th className="num">Findings</th><th>Last report</th></tr></thead>
                 <tbody>
                   {data.per_client.map((c) => (
                     <tr key={c.id}>
-                      <td><span className="flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: c.color }} />{c.name}</span></td>
+                      <td className="max-w-[180px]"><span className="flex min-w-0 items-center gap-2" title={c.name}><span className="size-2 shrink-0 rounded-full" style={{ background: c.color }} /><span className="truncate">{c.name}</span></span></td>
                       <td className="num">{c.runs}</td>
                       <td className="num">{c.findings ? <span className="font-semibold" style={{ color: "var(--warning)" }}>{c.findings}</span> : 0}</td>
-                      <td>{c.last_report ? <Link href={`/research/${c.last_report.id}?ws=${c.id}`} className="font-mono text-mono-sm text-accent-text hover:underline" title={utc(c.last_report.published_at)}>{c.last_report.id}</Link> : <span className="text-fg-faint">—</span>}</td>
+                      <td className="whitespace-nowrap">{c.last_report ? <Link href={`/research/${c.last_report.id}?ws=${c.id}`} className="font-mono text-mono-sm text-accent-text hover:underline" title={utc(c.last_report.published_at)}>{c.last_report.id}</Link> : <span className="text-fg-faint">—</span>}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              </div>
             </Panel>
           </div>
           {activeWorkspace && data.per_client[0] && (
@@ -132,7 +134,7 @@ function DashSkeleton() {
       <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
         {Array.from({ length: 6 }).map((_, i) => <div key={i} className="rounded-md border border-line bg-surface p-4"><Skeleton className="h-3 w-3/5" /><Skeleton className="mt-3 h-7 w-1/3" /><Skeleton className="mt-3 h-3 w-2/5" /></div>)}
       </div>
-      <div className="grid gap-6 lg:grid-cols-2">{[0, 1].map((i) => <div key={i} className="h-72 rounded-md border border-line bg-surface p-4"><Skeleton className="h-3 w-1/4" /><Skeleton className="mt-6 h-48 w-full" /></div>)}</div>
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">{[0, 1].map((i) => <div key={i} className="h-72 rounded-md border border-line bg-surface p-4"><Skeleton className="h-3 w-1/4" /><Skeleton className="mt-6 h-48 w-full" /></div>)}</div>
     </div>
   );
 }

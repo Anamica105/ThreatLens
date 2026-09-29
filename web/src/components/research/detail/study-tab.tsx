@@ -17,7 +17,7 @@ export function StudyTab({ d, patchRecord, canEdit }: DetailProps) {
   const sources = useMemo(() => Object.fromEntries(rec.sources.map((x) => [x.id, x])), [rec.sources]);
   const [editing, setEditing] = useState(false);
   return (
-    <div className="reading mx-auto space-y-10 xl:mx-0 xl:ml-[232px]">
+    <div className="reading mx-auto min-w-0 space-y-10 break-words xl:mx-0 xl:ml-[232px]">
       <div className="flex items-center gap-2">
         <GeneratedBadge state={rec.review?.study} />
         {canEdit && <Button size="sm" variant="tertiary" icon={<Pencil />} className="ml-auto" onClick={() => setEditing(true)}>Edit study notes</Button>}
@@ -42,7 +42,7 @@ export function StudyTab({ d, patchRecord, canEdit }: DetailProps) {
                 <li key={p.id}>
                   <div className="text-h4 font-semibold">{p.name}</div>
                   <div className="mt-1 flex flex-wrap items-center gap-1 text-body-sm text-fg-strong">
-                    {p.steps.map((st, i) => <span key={st.ref}>{i > 0 && <span className="px-1 text-fg-faint">→</span>}{st.behaviour.length > 60 ? st.behaviour.slice(0, 58) + "…" : st.behaviour}</span>)}
+                    {p.steps.map((st, i) => <span key={st.ref} className="break-words">{i > 0 && <span className="px-1 text-fg-faint">→</span>}{st.behaviour.length > 60 ? st.behaviour.slice(0, 58) + "…" : st.behaviour}<SourceRefs ids={st.source_ids} sources={sources} /></span>)}
                   </div>
                 </li>
               ))}
@@ -54,7 +54,7 @@ export function StudyTab({ d, patchRecord, canEdit }: DetailProps) {
         <section>
           <SectionHeading id="study-timeline">Timeline</SectionHeading>
           <ol className="space-y-2">
-            {rec.timeline.map((t, i) => <li key={i} className="flex gap-4 text-body-lg"><span className="w-28 shrink-0 tabular text-fg-muted">{t.date}</span><span>{t.event}<SourceRefs ids={t.source_ids} sources={sources} /></span></li>)}
+            {rec.timeline.map((t, i) => <li key={i} className="flex gap-4 text-body-lg"><span className="w-28 shrink-0 tabular text-fg-muted">{t.date}</span><span className="min-w-0 break-words">{t.event}<SourceRefs ids={t.source_ids} sources={sources} /></span></li>)}
           </ol>
         </section>
       )}

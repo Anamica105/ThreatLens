@@ -27,6 +27,62 @@ class Settings(BaseSettings):
     run_workers: int = 2
     fetch_timeout: float = 20.0
 
+    # CVE enrichment (NVD 2.0, CISA KEV, FIRST EPSS). Only CVE ids are ever sent.
+    cve_enrichment: bool = True
+    nvd_api_key: str = ""
+    cve_cache_hours: int = 24
+    enrichment_timeout: float = 10.0
+
+    # Run budget per depth (spec section 12): wall-clock minutes and LLM tokens.
+    run_budgets: dict = {
+        "quick": {"max_minutes": 5, "max_tokens": 250_000},
+        "standard": {"max_minutes": 10, "max_tokens": 600_000},
+        "deep": {"max_minutes": 20, "max_tokens": 1_200_000},
+    }
+    budget_warn_pct: float = 80.0
+    budget_enforce: bool = False  # true: stop the run at the next stage boundary once over budget
+
+    # View audit (spec section 13): one row per user + entity per window.
+    audit_dedupe_minutes: int = 10
+
+    # Secrets at rest (spec section 13: OSINT keys in a vault). Fernet key for values stored in the `setting` table.
+    # Env THREATLENS_SECRET_KEY; if empty, one is generated into <data_dir>/.secret_key (gitignored) with a warning.
+    threatlens_secret_key: str = ""
+
+    # Daily emerging-threat digest (app/digest.py). Once a day at digest_time_utc: rank what the vendor feeds published
+    # in the last digest_lookback_hours, research the top digest_max_threats for digest_workspace_id (first workspace
+    # if empty), and email the report + hunt queries to digest_recipients. Without SMTP the email is saved as .eml.
+    digest_enabled: bool = False
+    digest_time_utc: str = "06:30"
+    digest_recipients: str = ""  # comma-separated
+    digest_workspace_id: str = ""
+    digest_max_threats: int = 3
+    digest_lookback_hours: int = 36
+    digest_auto_research: bool = True  # false: headlines and article links only, no pipeline runs
+    digest_depth: str = "quick"
+    digest_max_queries: int = 8  # per threat, in the email body
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "ThreatLens <threatlens@localhost>"
+    smtp_starttls: bool = True  # ignored on port 465, which uses implicit TLS
+
+    # Auth (spec section 12: SSO via OIDC).
+    #   dev    - trust the `X-User` header sent by the web app's user switcher (falls back to the first user). Local only.
+    #   header - trust only `auth_header` (an email set by an OIDC-validating reverse proxy such as oauth2-proxy),
+    #            and only when the TCP peer is in `auth_trusted_proxies`. `X-User` is ignored.
+    #   oidc   - native bearer-token validation; not implemented yet (501). Planned keys: oidc_issuer,
+    #            oidc_audience, oidc_jwks_url (default <issuer>/.well-known/jwks.json), oidc_email_claim, oidc_role_claim.
+    auth_mode: str = "dev"
+    auth_header: str = "X-Forwarded-Email"
+    auth_trusted_proxies: str = "127.0.0.1,::1"  # comma-separated IPs or CIDRs
+    oidc_issuer: str = ""
+    oidc_audience: str = ""
+    oidc_jwks_url: str = ""
+    oidc_email_claim: str = "email"
+    oidc_role_claim: str = "roles"
+
 
 @lru_cache
 def get_settings() -> Settings:

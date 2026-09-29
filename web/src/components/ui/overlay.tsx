@@ -131,9 +131,10 @@ export function Popover({ trigger, children, open, onOpenChange, align = "start"
 
 export interface MenuItem { label: string; icon?: React.ReactNode; onSelect: () => void; danger?: boolean; disabled?: boolean; shortcut?: string; divider?: boolean }
 
-export function Menu({ trigger, items, align = "end", width = 200 }:
-  { trigger: (p: { ref: React.Ref<HTMLButtonElement>; onClick: () => void; "aria-expanded": boolean; "aria-haspopup": "dialog" | "menu" }) => React.ReactNode; items: MenuItem[]; align?: "start" | "end"; width?: number }) {
-  const [open, setOpen] = useState(false);
+export function Menu({ trigger, items, align = "end", width = 200, onOpenChange }:
+  { trigger: (p: { ref: React.Ref<HTMLButtonElement>; onClick: () => void; "aria-expanded": boolean; "aria-haspopup": "dialog" | "menu" }) => React.ReactNode; items: MenuItem[]; align?: "start" | "end"; width?: number; onOpenChange?: (o: boolean) => void }) {
+  const [open, setOpenState] = useState(false);
+  const setOpen = useCallback((o: boolean) => { setOpenState(o); onOpenChange?.(o); }, [onOpenChange]);
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement | null>(null);
   const enabled = items.filter((i) => !i.divider);

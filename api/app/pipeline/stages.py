@@ -11,12 +11,15 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
-from .. import attack, detection, llm, osint
+from .. import attack, detection, llm, osint, vulns
 from ..config import get_settings
 from ..db import SessionLocal
-from ..ioc import defang, extract as extract_iocs, refang
-from ..models import Actor, Ioc, MalwareTool, Research, Workspace
-from ..records import (applicability, coverage_gaps, ensure_results, log_activity, next_id, save_record)
+from ..ioc import (KNOWN_GOOD_HASHES_SETTING, _in_allow_list, _is_public_ip, defang, extract as extract_iocs,
+                   known_good_hash, refang)
+from ..models import Actor, Ioc, MalwareTool, Research, Setting, Workspace
+from ..records import (applicability, apply_ioc_review, coverage_gaps, ensure_results, hidden_from_hunts, ioc_key,
+                       library_overrides_by_key, log_activity, mitre_source_ids, next_id, opportunity_source_ids,
+                       save_record, sort_sids, spec_key, step_index)
 from ..sources import VENDORS, discover, fetch, relevance, vendor_for_url
 from .runner import STAGES, Ctx, StageWarning
 from . import schemas as SC
@@ -454,6 +457,59 @@ def stage_attack(ctx: Ctx):
 
 # --------------------------------------------------------------------------- 6. Detection reasoning
 
+MAX_OPPS_PER_STEP = 2       # best 1-2 opportunities per attack-path step
+MAX_OPPS_TOTAL = 15
+MAX_GENERIC_HUNTS = 5       # cap on generic (not threat-specific) TTP hunt groups when opted in
+STRONG_CATEGORIES = {"process_creation": 2, "web": 2, "file_event": 1}  # behaviours that survive IoC rotation
+
+
+def select_opportunities(opps: list[dict], paths: list[dict], mitre: list[dict], per_step: int = MAX_OPPS_PER_STEP,
+                         max_total: int = MAX_OPPS_TOTAL) -> list[dict]:
+    """De-duplicate opportunities with the same logic, keep the best `per_step` per attack-path step, number them
+    DO-n and attach data_sources and source_ids."""
+    steps = step_index(paths)
+    merged: dict[str, dict] = {}
+    for o in opps:
+        k = spec_key(o["spec"])
+        if k in merged:  # same logic: keep the first, merge techniques
+            m = merged[k]
+            m["techniques"] = list(dict.fromkeys(m.get("techniques", []) + o.get("techniques", [])))
+            continue
+        merged[k] = {**o, "techniques": list(o.get("techniques", []))}
+    uniq = list(merged.values())
+
+    def score(o: dict) -> float:
+        spec = o["spec"]
+        st = steps.get(o.get("behaviour_ref") or "") or {}
+        s = len(spec.get("conditions", [])) + len({c.get("field") for c in spec.get("conditions", [])}) * 0.5
+        s += STRONG_CATEGORIES.get(spec.get("category"), 0)
+        if st.get("technique_id") and st["technique_id"] in o.get("techniques", []):
+            s += 2
+        if o.get("type") == "ioa":
+            s += 1
+        return s
+
+    by_step: dict[str, list[int]] = {}
+    for idx, o in enumerate(uniq):
+        key = o.get("behaviour_ref") or f"tech:{(o.get('techniques') or [''])[0]}"
+        by_step.setdefault(key, []).append(idx)
+    keep: set[int] = set()
+    for idxs in by_step.values():
+        keep |= set(sorted(idxs, key=lambda i: -score(uniq[i]))[:per_step])
+    if len(keep) > max_total:
+        keep = set(sorted(keep, key=lambda i: -score(uniq[i]))[:max_total])
+    out = []
+    for idx, o in enumerate(uniq):
+        if idx not in keep:
+            continue
+        o = dict(o)
+        o["id"] = f"DO-{len(out) + 1}"
+        o["data_sources"] = [o["spec"]["category"]]
+        o["source_ids"] = opportunity_source_ids(o, steps, mitre)
+        out.append(o)
+    return out
+
+
 def stage_detection(ctx: Ctx):
     syn = ctx.artifacts["synthesis"]
     mitre = ctx.artifacts["attack"]["mitre"]
@@ -464,7 +520,8 @@ def stage_detection(ctx: Ctx):
                     for i, p in enumerate(paths, 1) for j, s in enumerate(p["steps"], 1)]
         res, tok = llm.structured(
             SC.OpportunityList,
-            "For each attack-path step below, write the behavioural detection opportunities a hunter can act on. Prefer "
+            "For each attack-path step below, write the one or two best behavioural detection opportunities a hunter can act "
+            "on (never more than two per step, and never two with the same logic). Prefer "
             "behaviours that survive indicator rotation (process lineage, HTTP request shape, file writes in unusual paths). "
             "For each, express the logic as a neutral detection spec using only these fields: parent_image, grandparent_image, "
             "image, command_line (process_creation); target_filename (file_event); http_method, url_path, referer, user_agent, "
@@ -484,9 +541,10 @@ def stage_detection(ctx: Ctx):
             for t in TECHNIQUE_OPPORTUNITIES.get(tid, []):
                 if t["type"] == "ioa":
                     opps.append({**t, "behaviour_ref": step_ref.get(tid, ""), "techniques": [tid]})
-    for i, o in enumerate(opps, 1):
-        o["id"] = f"DO-{i}"
-        o["data_sources"] = [o["spec"]["category"]]
+    raw = len(opps)
+    opps = select_opportunities(opps, paths, mitre)
+    if raw != len(opps):
+        ctx.log(f"{raw} candidate opportunities → {len(opps)} after de-duplication and the {MAX_OPPS_PER_STEP}-per-step cap")
     ctx.log(f"{len(opps)} detection opportunities")
     return {"opportunities": opps}, f"{len(opps)} opportunities"
 
@@ -511,19 +569,39 @@ def _vuln_queries(cves: list[str], platforms: list[str], days: int) -> list[dict
     return out
 
 
+def workspace_platforms(db, workspace_ids: list[str]) -> list[str]:
+    """Union of the selected workspaces' configured platforms (their defaults), Sigma always included."""
+    out: list[str] = []
+    for wid in workspace_ids or []:
+        ws = db.get(Workspace, wid)
+        for p in (ws.platforms or []) if ws else []:
+            if p in detection.PLATFORM_IDS and p not in out:
+                out.append(p)
+    return ["sigma"] + [p for p in out if p != "sigma"]
+
+
 def stage_queries(ctx: Ctx):
     cfg = ctx.refresh_config()
-    platforms = [p for p in cfg.get("platforms", ["spl", "kql_defender"]) if p in detection.PLATFORM_IDS]
     days = int(cfg.get("lookback_days", 30))
+    with SessionLocal() as db:
+        platforms = [p for p in (cfg.get("platforms") or workspace_platforms(db, cfg.get("workspace_ids", [])))
+                     if p in detection.PLATFORM_IDS]
     ext = ctx.artifacts["extraction"]["results"]
-    ioc_values: dict[str, set] = {"ipv4": set(), "domain": set(), "sha256": set()}
+    ioc_values: dict[str, dict[str, set]] = {t: {} for t in IOC_HUNT_TYPES}
+    with SessionLocal() as db:
+        hidden, note = pipeline_hunt_filter(db, ctx.research_id, ctx.artifacts)
+    if note:
+        ctx.log(note)
     vendor_queries = []
     for r in ext.values():
         if not r.get("ok"):
             continue
         for i in r.get("regex_iocs", []) + [{"type": x["type"], "value": x["value"]} for x in r["notes"].get("iocs", [])]:
             if i["type"] in ioc_values:
-                ioc_values[i["type"]].add(refang(i["value"]).lower())
+                v = refang(i["value"]).lower()
+                if ioc_key(i["type"], v) in hidden or not _hunt_candidate(i["type"], v):
+                    continue
+                ioc_values[i["type"]].setdefault(v, set()).add(r["id"])
         for vq in r["notes"].get("vendor_queries", []):
             vendor_queries.append({**vq, "source_id": r["id"]})
 
@@ -543,99 +621,370 @@ def stage_queries(ctx: Ctx):
     with SessionLocal() as db:
         queries = generate_queries(
             db, ctx.artifacts["detection"]["opportunities"], platforms, days,
-            {k: sorted(v) for k, v in ioc_values.items()},
-            [v["cve"] for v in ctx.artifacts["synthesis"]["entities"]["vulnerabilities"]],
+            {k: {v: sort_sids(s) for v, s in sorted(vals.items())} for k, vals in ioc_values.items()},
+            ctx.artifacts["synthesis"]["entities"]["vulnerabilities"],
             [m["technique_id"] for m in ctx.artifacts["attack"]["mitre"]], vendor_queries,
-            llm_fill if _use_llm(ctx) else None, ctx.log)
+            llm_fill if _use_llm(ctx) else None, ctx.log,
+            mitre=ctx.artifacts["attack"]["mitre"], include_generic=bool(cfg.get("include_generic_hunts", False)))
         db.commit()
     lint_fail = sum(1 for q in queries if q["lint"])
-    ctx.log(f"{len(queries)} queries ({sum(1 for q in queries if q['origin'] == 'reference')} vendor reference); {lint_fail} failed lint")
-    return {"queries": queries}, f"{len(queries)} queries"
+    groups = len({q["group"] for q in queries})
+    ctx.log(f"{groups} detections, {len(queries)} query variants on {', '.join(platforms)} "
+            f"({sum(1 for q in queries if q['origin'] == 'reference')} vendor reference); {lint_fail} failed lint")
+    return {"queries": queries}, f"{groups} detections · {len(queries)} queries"
 
 
-def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_values: dict[str, list[str]], cves: list[str],
-                     techniques: list[str], vendor_queries: list[dict], llm_fill=None, logf=lambda m, level="info": None) -> list[dict]:
-    """Sigma first, then per-platform translation, plus IoC, vulnerability, TTP and vendor reference queries."""
+def _query_row(db, type_, title, platform, body, group, source_ids, provenance, opp=None, techniques=(), fp="",
+               data_sources=(), origin="generated", log_sources=None, sigma_ref=None, engine=None) -> dict:
+    """One query dict as stored in record.hunts.queries (allocates the next Q- id). `engine` records what produced the
+    body: "pysigma:<backend>" | "builtin" | "llm" (defaults to builtin for generated queries, None for vendor ones)."""
+    issues = detection.lint(platform, body) if origin == "generated" else []
+    return {
+        "id": next_id(db, "query", "Q"), "group": group, "type": type_, "title": title, "platform": platform, "body": body,
+        "opportunity_id": opp, "techniques": list(techniques), "fp_notes": fp, "data_sources": list(data_sources),
+        "log_sources": log_sources if log_sources is not None else [detection.LOG_SOURCES.get(c, {}).get(platform, c) for c in data_sources],
+        "status": "reference" if origin == "reference" else ("syntax_checked" if not issues else "generated"),
+        "lint": issues, "origin": origin, "sigma_ref": sigma_ref,
+        "engine": engine if engine is not None else (None if origin == "reference" else detection.ENGINE_BUILTIN),
+        "source_ids": list(source_ids), "provenance": provenance,
+    }
+
+
+# ---- IoC retro-hunt groups (IOC-IPV4 / IOC-DOMAIN / IOC-SHA256) ----
+# Indicators hidden from hunts (spec 9): benign / false positive (analyst, library override, GreyNoise, known-good
+# hash), excluded by the analyst, or expired unless the hunter opted in (record.ioc_review.include_expired).
+
+IOC_HUNT_TYPES = ("ipv4", "domain", "sha256")
+IOC_HUNT_MAX = 200
+_IOC_CAT = {"ipv4": "network", "domain": "dns", "sha256": "file_hash"}
+
+
+def ioc_group(t: str) -> str:
+    return f"IOC-{t.upper()}"
+
+
+def _hunt_candidate(t: str, v: str) -> bool:
+    """Allow-list check applied to every retro-hunt value (LLM-noted indicators skip the regex extractor's filters)."""
+    if t == "ipv4":
+        return _is_public_ip(v)
+    if t == "domain":
+        return not _in_allow_list(v)
+    if t == "sha256":
+        return known_good_hash(v) is None
+    return True
+
+
+def build_ioc_queries(db, platforms: list[str], days: int, ioc_values: dict, types=IOC_HUNT_TYPES) -> list[dict]:
+    """IoC retro-hunt queries: one group per indicator type, Sigma (when in `platforms`) plus each native platform.
+    ioc_values: {type: {value: [source ids]}} (or {type: [values]}). Each query carries `ioc_values` (the refanged
+    values it hunts) so a later regeneration can tell whether the group changed."""
+    platforms = [p for p in dict.fromkeys(platforms) if p in detection.PLATFORM_IDS]
+    native = [p for p in platforms if p != "sigma"]
+    out: list[dict] = []
+    for t in types:
+        vals = ioc_values.get(t) or {}
+        if not isinstance(vals, dict):
+            vals = {v: [] for v in vals}
+        vs = sorted(vals)[:IOC_HUNT_MAX]
+        if not vs:
+            continue
+        group = ioc_group(t)
+        sids = sort_sids(s for v in vs for s in vals.get(v, []))
+        title = f"Retro-hunt: {len(vs)} {t.upper() if t != 'domain' else 'domain'} indicator(s)"
+        cat = _IOC_CAT[t]
+        field = {"network": "dst_ip", "dns": "domain", "file_hash": "sha256"}[cat]
+        sig_id = None
+        rows: list[dict] = []
+        if "sigma" in platforms:
+            spec = {"category": cat, "conditions": [{"field": field, "op": "contains" if cat == "file_hash" else "equals", "values": vs}]}
+            rows.append(_query_row(db, "ioc", title, "sigma", detection.to_sigma(
+                title, spec, group, [], "Shared or re-assigned infrastructure; check timestamps against the campaign window."),
+                group, sids, "derived", data_sources=[cat]))
+            sig_id = rows[-1]["id"]
+        for p in native:
+            r = detection.render_ioc_query(p, cat, vs, days)
+            if r:
+                rows.append(_query_row(db, "ioc", title, p, r["body"], group, sids, "derived", data_sources=[cat], sigma_ref=sig_id,
+                                       log_sources=r.get("log_sources"), engine=r["engine"]))
+        for q in rows:
+            q["ioc_values"] = vs
+        out += rows
+    return out
+
+
+def record_hunt_values(rec: dict) -> dict[str, dict[str, list[str]]]:
+    """{type: {refanged lower value: [source ids]}} for the record's indicators that are not hidden from hunts.
+    Call records.apply_ioc_review(rec, ...) first so `hidden_from_hunts` is current."""
+    out: dict[str, dict[str, set]] = {t: {} for t in IOC_HUNT_TYPES}
+    for i in rec.get("iocs", []) or []:
+        t = i.get("type")
+        if t not in out or i.get("hidden_from_hunts"):
+            continue
+        v = refang(i.get("value", "")).lower()
+        if v and _hunt_candidate(t, v):
+            out[t].setdefault(v, set()).update(i.get("source_ids") or [])
+    return {t: {v: sort_sids(s) for v, s in sorted(vals.items())} for t, vals in out.items()}
+
+
+def _group_count(qs: list[dict]) -> int:
+    for q in qs:
+        if isinstance(q.get("ioc_values"), list):
+            return len(q["ioc_values"])
+    m = re.match(r"Retro-hunt: (\d+)", (qs[0].get("title") if qs else "") or "")
+    return int(m.group(1)) if m else 0
+
+
+def log_sources_required(queries: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for q in queries:
+        for cat in q.get("data_sources", []):
+            row = {"data_source": cat, "label": detection.CATEGORIES.get(cat, cat), **detection.LOG_SOURCES.get(cat, {})}
+            if row not in out:
+                out.append(row)
+    return out
+
+
+def regenerate_ioc_queries(db, rec: dict, platforms: list[str] | None = None, days: int | None = None,
+                           fallback_platforms: list[str] | None = None, force: bool = False) -> list[dict]:
+    """Rebuild ONLY the IoC retro-hunt groups of a record from its current (non-hidden) indicators; every other query
+    group is left untouched. A group whose value set is unchanged keeps its queries (ids, statuses) unless `force`;
+    a changed group gets fresh query ids; a group left with no values is removed.
+
+    Platforms: those the record's IoC queries were generated for, else every platform in its generated queries, else
+    hunts.platforms, else `fallback_platforms` (e.g. the workspaces' defaults). Mutates `rec`.
+    Returns [{"group", "before", "after"}] (indicator counts) for groups that changed."""
+    hunts = rec.setdefault("hunts", {})
+    queries = list(hunts.get("queries") or [])
+    old_by_group: dict[str, list[dict]] = {}
+    for q in queries:
+        if str(q.get("group", "")).startswith("IOC-") and q.get("type") == "ioc":
+            old_by_group.setdefault(q["group"], []).append(q)
+    if platforms is None:
+        ioc_plats = [q["platform"] for qs in old_by_group.values() for q in qs]
+        gen_plats = [q["platform"] for q in queries if q.get("origin", "generated") == "generated" and q.get("platform")]
+        platforms = list(dict.fromkeys(ioc_plats or gen_plats or hunts.get("platforms") or fallback_platforms or ["sigma"]))
+    days = int(days or hunts.get("lookback_days") or 30)
+    values = record_hunt_values(rec)
+
+    changes: list[dict] = []
+    rebuilt: dict[str, list[dict]] = {}
+    for t in IOC_HUNT_TYPES:
+        g = ioc_group(t)
+        old = old_by_group.get(g, [])
+        new_vals = sorted(values.get(t) or {})[:IOC_HUNT_MAX]
+        old_vals = next((q["ioc_values"] for q in old if isinstance(q.get("ioc_values"), list)), None)
+        if old_vals is None and old:
+            # Queries written before `ioc_values` existed: same count and every value present in the body = unchanged.
+            body = " ".join(q.get("body", "") for q in old).lower()
+            same = _group_count(old) == len(new_vals) and all(v in body for v in new_vals)
+        else:
+            same = old_vals == new_vals
+        if old and not force and same:
+            rebuilt[g] = old
+            continue
+        if not old and not new_vals:
+            continue
+        rebuilt[g] = build_ioc_queries(db, platforms, days, {t: values.get(t) or {}}, types=(t,)) if new_vals else []
+        before, after = _group_count(old), len(new_vals)
+        if old or after:
+            changes.append({"group": g, "before": before, "after": after})
+
+    if not changes:
+        return []
+    first = next((n for n, q in enumerate(queries) if str(q.get("group", "")).startswith("IOC-") and q.get("type") == "ioc"), None)
+    if first is None:
+        first = next((n for n, q in enumerate(queries) if re.match(r"(VULN|TTP|VREF)-", str(q.get("group", "")))), len(queries))
+    others_before = [q for q in queries[:first] if not (str(q.get("group", "")).startswith("IOC-") and q.get("type") == "ioc")]
+    others_after = [q for q in queries[first:] if not (str(q.get("group", "")).startswith("IOC-") and q.get("type") == "ioc")]
+    new_ioc = [q for t in IOC_HUNT_TYPES for q in rebuilt.get(ioc_group(t), [])]
+    hunts["queries"] = others_before + new_ioc + others_after
+    hunts["ioc_queries"] = [q["id"] for q in hunts["queries"] if q.get("type") == "ioc"]
+    rec["log_sources_required"] = log_sources_required(hunts["queries"])
+    return changes
+
+
+_AUTO_STATUSES = (None, "", "generated", "syntax_checked")
+
+
+def regenerate_detection_queries(rec: dict, days: int | None = None, force: bool = False) -> list[str]:
+    """Re-render the record's behavioural queries (DET-* from detection opportunities, TTP-* generic hunts) with the
+    current engines (pySigma where available, built-in otherwise), in place: query ids, groups and sigma_refs are kept.
+
+    Only queries still at an automatic status (generated / syntax_checked) are touched, so analyst-reviewed or deployed
+    queries never change under the analyst; LLM-written variants are kept unless `force`, in which case a
+    deterministic engine replaces them where it can. Sigma rows are re-rendered too (UUID ids, escaping).
+    IoC groups are handled by regenerate_ioc_queries(force=True). Mutates `rec`; returns the ids of changed queries."""
+    hunts = rec.get("hunts") or {}
+    days = int(days or hunts.get("lookback_days") or 30)
+    opps = {o.get("id"): o for o in rec.get("detection_opportunities", []) or [] if o.get("spec")}
+    templates = {t["title"]: (tid, t) for tid, ts in TECHNIQUE_OPPORTUNITIES.items() for t in ts}
+    changed: list[str] = []
+    sigma_by_group: dict[str, str] = {}
+    queries = hunts.get("queries") or []
+    # Sigma rows first so the per-platform rows translate from the refreshed rule.
+    for q in sorted(queries, key=lambda q: q.get("platform") != "sigma"):
+        if q.get("origin", "generated") != "generated" or q.get("type") in ("ioc", "vuln"):
+            continue
+        if q.get("opportunity_id") in opps:
+            o = opps[q["opportunity_id"]]
+            spec, title, rule_id = o["spec"], o.get("title", q.get("title", "")), o["id"]
+            techs, fp, level = o.get("techniques", []), o.get("fp_notes", ""), "high"
+        elif str(q.get("group", "")).startswith("TTP-") and q.get("title") in templates:
+            tid, t = templates[q["title"]]
+            spec, title, rule_id, techs, fp, level = t["spec"], t["title"], q["group"], [tid], t["fp_notes"], "medium"
+        else:
+            continue
+        sigma = sigma_by_group.get(q.get("group")) or detection.to_sigma(title, spec, rule_id, techs, fp, level=level)
+        sigma_by_group[q.get("group")] = sigma
+        if q.get("status") not in _AUTO_STATUSES or (q.get("engine") == detection.ENGINE_LLM and not force):
+            continue
+        if q.get("platform") == "sigma":
+            new = {"body": sigma, "engine": detection.ENGINE_BUILTIN}
+        else:
+            new = detection.render_query(spec, q.get("platform", ""), days, title, sigma)
+        if not new or (new["body"] == q.get("body") and new["engine"] == q.get("engine")):
+            continue
+        q["body"], q["engine"] = new["body"], new["engine"]
+        if new.get("log_sources"):
+            q["log_sources"] = new["log_sources"]
+        q["lint"] = detection.lint(q["platform"], q["body"], q.get("techniques"))
+        q["status"] = "generated" if q["lint"] else "syntax_checked"
+        changed.append(q.get("id"))
+    return changed
+
+
+def pipeline_hunt_filter(db, research_id: str | None, artifacts: dict) -> tuple[set[str], str]:
+    """Keys (records.ioc_key) of indicators to leave out of retro-hunts when query generation runs.
+
+    Query generation runs in parallel with IoC enrichment (runner.MAIN_CHAIN vs the "iocs" thread), so this run's OSINT
+    verdicts may not exist yet. It uses what is available: the record's analyst decisions from earlier versions,
+    library verdict overrides, the verdicts of the latest completed IoC stage (a previous run, or this run if it has
+    finished) and the known-good hash list. The allow-lists are applied by _hunt_candidate. stage_report then re-applies
+    the final verdicts and regenerates the IoC groups if anything else must be hidden."""
+    prev = {}
+    if research_id:
+        r = db.get(Research, research_id)
+        prev = (r.record or {}) if r else {}
+    review = prev.get("ioc_review") or {}
+    decisions = review.get("decisions") or {}
+    include_expired = bool(review.get("include_expired"))
+    lib = library_overrides_by_key(db)
+    art_verdicts = {ioc_key(i["type"], i["value"]): i.get("verdict") for i in (artifacts.get("iocs") or {}).get("iocs", []) or []}
+    hidden: set[str] = set()
+    for k in set(decisions) | set(lib) | set(art_verdicts):
+        d, lo = decisions.get(k) or {}, lib.get(k) or {}
+        v = d.get("verdict") or lo.get("verdict") or art_verdicts.get(k)
+        if hidden_from_hunts(v, bool(d.get("excluded")), include_expired):
+            hidden.add(k)
+    note = (f"{len(hidden)} indicator(s) left out of retro-hunts (benign, false positive, excluded or expired)"
+            if hidden else "")
+    return hidden, note
+
+
+def generate_queries(db, opps: list[dict], platforms: list[str], days: int, ioc_values: dict, cves: list,
+                     techniques: list[str], vendor_queries: list[dict], llm_fill=None, logf=lambda m, level="info": None,
+                     *, mitre: list[dict] | None = None, include_generic: bool = False,
+                     max_generic: int = MAX_GENERIC_HUNTS) -> list[dict]:
+    """Sigma first, then per-platform translation, plus IoC, vulnerability, TTP and vendor reference queries.
+
+    Every query carries `group` (shared by all platform variants of one detection), `source_ids` and `provenance`
+    ("vendor" copied from an article, "derived" from sourced behaviours/IoCs/CVEs, "generic" not threat-specific).
+
+    ioc_values: {type: {value: [source ids]}} (or {type: [values]} with no source trail).
+    cves: [{"cve", "source_ids"}] (or plain CVE strings).
+    Only `platforms` are generated; Sigma is always written for behavioural groups as the neutral source of truth.
+    Generic TTP hunts are opt-in (`include_generic`) and capped at `max_generic` groups.
+    """
+    mitre = mitre or []
+    platforms = [p for p in dict.fromkeys(platforms) if p in detection.PLATFORM_IDS]
+    native = [p for p in platforms if p != "sigma"]
     queries: list[dict] = []
     missing: list[dict] = []
-    if True:
-        def qid() -> str:
-            return next_id(db, "query", "Q")
 
-        def add(type_, title, platform, body, opp=None, techniques=(), fp="", data_sources=(), origin="generated", log_sources=None, sigma_ref=None):
-            issues = detection.lint(platform, body) if origin == "generated" else []
-            queries.append({
-                "id": qid(), "type": type_, "title": title, "platform": platform, "body": body,
-                "opportunity_id": opp, "techniques": list(techniques), "fp_notes": fp, "data_sources": list(data_sources),
-                "log_sources": log_sources if log_sources is not None else [detection.LOG_SOURCES.get(c, {}).get(platform, c) for c in data_sources],
-                "status": "reference" if origin == "reference" else ("syntax_checked" if not issues else "generated"),
-                "lint": issues, "origin": origin, "sigma_ref": sigma_ref,
-            })
+    def add(type_, title, platform, body, group, source_ids, provenance, opp=None, techniques=(), fp="", data_sources=(),
+            origin="generated", log_sources=None, sigma_ref=None, engine=None):
+        queries.append(_query_row(db, type_, title, platform, body, group, source_ids, provenance, opp, techniques, fp,
+                                  data_sources, origin, log_sources, sigma_ref, engine))
 
-        # IoA / TTP queries from detection opportunities (Sigma first, then per platform)
-        for o in opps:
-            sigma = detection.to_sigma(o["title"], o["spec"], o["id"], o.get("techniques", []), o.get("fp_notes", ""))
-            add(o["type"], o["title"], "sigma", sigma, o["id"], o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"])
-            sig_id = queries[-1]["id"]
-            for p in platforms:
-                if p == "sigma":
-                    continue
-                body = detection.translate(o["spec"], p, days, o["title"])
-                if body is None:
-                    missing.append({"opportunity": o, "platform": p, "sigma": sigma, "sigma_ref": sig_id})
-                    continue
-                add(o["type"], o["title"], p, body, o["id"], o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=sig_id)
-
-        if missing and llm_fill:
-            by_pair = {(m["opportunity"]["id"], m["platform"]): m for m in missing}
-            for q in llm_fill(missing):
-                m = by_pair.get((q["opportunity_id"], q["platform"]))
-                if m:
-                    o = m["opportunity"]
-                    add(o["type"], o["title"], q["platform"], q["query"], o["id"], o.get("techniques", []), o.get("fp_notes", ""),
-                        o["data_sources"], sigma_ref=m["sigma_ref"])
-        elif missing:
-            gaps = sorted({f"{detection.PLATFORM_BY_ID[m['platform']]['short']} ({detection.CATEGORIES[m['opportunity']['spec']['category']]})" for m in missing})
-            logf(f"No native telemetry for: {', '.join(gaps)}", "warn")
-
-        # IoC retro-hunt queries
-        cat_for = {"ipv4": "network", "domain": "dns", "sha256": "file_hash"}
-        for t, vs in ioc_values.items():
-            vs = sorted(vs)[:200]
-            if not vs:
+    # IoA / TTP queries from detection opportunities (Sigma first, then per platform). One group per opportunity.
+    for o in opps:
+        group = "DET-" + o["id"].split("-", 1)[-1] if o["id"].startswith("DO-") else f"DET-{o['id']}"
+        sids = o.get("source_ids") or mitre_source_ids(mitre, o.get("techniques", []))
+        sigma = detection.to_sigma(o["title"], o["spec"], o["id"], o.get("techniques", []), o.get("fp_notes", ""))
+        add(o["type"], o["title"], "sigma", sigma, group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
+            o["data_sources"])
+        sig_id = queries[-1]["id"]
+        for p in native:
+            r = detection.render_query(o["spec"], p, days, o["title"], sigma)
+            if r is None:
+                missing.append({"opportunity": o, "platform": p, "sigma": sigma, "sigma_ref": sig_id, "group": group, "source_ids": sids})
                 continue
-            for p in platforms:
-                if p == "sigma":
-                    continue
-                body = detection.ioc_query(p, cat_for[t], vs, days)
-                if body:
-                    add("ioc", f"Retro-hunt: {len(vs)} {t.upper() if t != 'domain' else 'domain'} indicator(s)", p, body,
-                        data_sources=[cat_for[t]])
+            add(o["type"], o["title"], p, r["body"], group, sids, "derived", o["id"], o.get("techniques", []), o.get("fp_notes", ""),
+                o["data_sources"], sigma_ref=sig_id, log_sources=r.get("log_sources"), engine=r["engine"])
 
-        # Vulnerability exposure queries
-        if cves:
-            for v in _vuln_queries(cves, platforms, days):
-                add("vuln", f"Exposure to {', '.join(cves[:4])}{' +' + str(len(cves) - 4) if len(cves) > 4 else ''}", v["platform"], v["body"],
-                    data_sources=["vuln_mgmt"], log_sources=v["log_sources"])
+    if missing and llm_fill:
+        by_pair = {(m["opportunity"]["id"], m["platform"]): m for m in missing}
+        for q in llm_fill(missing):
+            m = by_pair.pop((q["opportunity_id"], q["platform"]), None)
+            if m:
+                o = m["opportunity"]
+                add(o["type"], o["title"], q["platform"], q["query"], m["group"], m["source_ids"], "derived", o["id"],
+                    o.get("techniques", []), o.get("fp_notes", ""), o["data_sources"], sigma_ref=m["sigma_ref"],
+                    engine=detection.ENGINE_LLM)
+    elif missing:
+        gaps = sorted({f"{detection.PLATFORM_BY_ID[m['platform']]['short']} ({detection.CATEGORIES[m['opportunity']['spec']['category']]})" for m in missing})
+        logf(f"No native telemetry for: {', '.join(gaps)}", "warn")
 
-        # Wider TTP hunts (not threat-specific)
-        used = {o["title"] for o in opps}
+    # IoC retro-hunt: one group per indicator type, Sigma plus each platform.
+    queries += build_ioc_queries(db, platforms, days, ioc_values)
+
+    # Vulnerability exposure: one group for all CVEs.
+    cve_rows = [c if isinstance(c, dict) else {"cve": c, "source_ids": []} for c in cves or []]
+    cve_ids = list(dict.fromkeys(c["cve"] for c in cve_rows if c.get("cve")))
+    if cve_ids:
+        sids = sort_sids(s for c in cve_rows for s in c.get("source_ids", []))
+        title = f"Exposure to {', '.join(cve_ids[:4])}{' +' + str(len(cve_ids) - 4) if len(cve_ids) > 4 else ''}"
+        for v in _vuln_queries(cve_ids, platforms, days):
+            add("vuln", title, v["platform"], v["body"], "VULN-1", sids, "derived", data_sources=["vuln_mgmt"],
+                log_sources=v["log_sources"])
+
+    # Wider TTP hunts (not threat-specific): opt-in, capped, never duplicating an opportunity's logic.
+    if include_generic:
+        used_titles = {o["title"] for o in opps}
+        used_specs = {spec_key(o["spec"]) for o in opps}
+        n = 0
         for tid in dict.fromkeys(techniques):
             for t in TECHNIQUE_OPPORTUNITIES.get(tid, []):
-                if t["type"] != "ttp" or t["title"] in used:
+                if n >= max_generic:
+                    break
+                if t["type"] != "ttp" or t["title"] in used_titles or spec_key(t["spec"]) in used_specs:
                     continue
-                used.add(t["title"])
-                for p in platforms:
-                    if p == "sigma":
-                        continue
-                    body = detection.translate(t["spec"], p, days, t["title"])
-                    if body:
-                        add("ttp", t["title"], p, body, None, [tid], t["fp_notes"], [t["spec"]["category"]])
+                used_titles.add(t["title"])
+                used_specs.add(spec_key(t["spec"]))
+                n += 1
+                group = f"TTP-{n}"
+                sids = mitre_source_ids(mitre, [tid])
+                sigma = detection.to_sigma(t["title"], t["spec"], group, [tid], t["fp_notes"], level="medium")
+                add("ttp", t["title"], "sigma", sigma, group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]])
+                sig_id = queries[-1]["id"]
+                for p in native:
+                    r = detection.render_query(t["spec"], p, days, t["title"], sigma)
+                    if r:
+                        add("ttp", t["title"], p, r["body"], group, sids, "generic", None, [tid], t["fp_notes"], [t["spec"]["category"]],
+                            sigma_ref=sig_id, log_sources=r.get("log_sources"), engine=r["engine"])
 
-        # Vendor-supplied reference queries, stored next to generated ones
-        for vq in vendor_queries:
-            plat = vq["platform"] if vq["platform"] in detection.PLATFORM_IDS else "kql_defender" if "kql" in vq["platform"].lower() else vq["platform"]
-            add("ioa", f"{vq['title']} (vendor, {vq.get('source_id', '')})".replace(", )", ")"), plat, vq["query"], origin="reference", log_sources=[])
+    # Vendor-supplied reference queries: each its own group, kept verbatim (deduplicated by body).
+    seen_bodies: set[str] = set()
+    n = 0
+    for vq in vendor_queries:
+        norm = re.sub(r"\s+", " ", vq.get("query", "")).strip().lower()
+        if not norm or norm in seen_bodies:
+            continue
+        seen_bodies.add(norm)
+        n += 1
+        plat = vq["platform"] if vq["platform"] in detection.PLATFORM_IDS else "kql_defender" if "kql" in vq["platform"].lower() else vq["platform"]
+        add("ioa", f"{vq['title']} (vendor, {vq.get('source_id', '')})".replace(", )", ")"), plat, vq["query"], f"VREF-{n}",
+            [vq["source_id"]] if vq.get("source_id") else [], "vendor", origin="reference", log_sources=[])
     return queries
 
 
@@ -669,8 +1018,13 @@ def stage_iocs(ctx: Ctx):
                     m["contexts"].append(c)
     ctx.log(f"{len(merged)} unique indicators after refang + dedupe")
 
+    # Publication date per vendor source, for the intel first-seen that expiry is counted from (seed text has none).
+    published = {sid: ((ext.get(sid) or {}).get("fetch") or {}).get("published") or s.get("published")
+                 for sid, s in sources.items() if s.get("origin") != "seed_text"}
     with SessionLocal() as db:
         keys = osint.get_keys(db)
+        expiry = osint.get_expiry(db)
+        extra_good = (db.get(Setting, KNOWN_GOOD_HASHES_SETTING) or Setting(value={})).value or {}
         enabled = [p["name"] for p in osint.PROVIDERS if keys.get(p["id"])]
         if not enabled:
             ctx.log("No OSINT API keys configured; verdicts use vendor context only (Settings > OSINT API keys)", "warn")
@@ -700,16 +1054,22 @@ def stage_iocs(ctx: Ctx):
             # "Named as C2/payload by a vendor": the role, or the sentence the indicator came from, says what it is.
             named = any(ROLE_MALICIOUS.search(r) for r in m["roles"]) or any(ROLE_MALICIOUS.search(c) for c in m["contexts"])
             listed = bool(vendor_sids)  # appears in a vendor's indicator list without a stated role
+            good = known_good_hash(m["value"], extra_good) if m["type"] in ("sha256", "sha1", "md5") else None
+            fs = osint.intel_first_seen(rep, [published.get(s) for s in m["source_ids"]])
             if named and vendor_sids:
-                v = osint.verdict(m["type"], rep, True, best_rel, cached.first_seen if cached else None)
+                v = osint.verdict(m["type"], rep, True, best_rel, fs, expiry, known_good=bool(good))
             else:
-                v = osint.verdict(m["type"], rep, listed and m["type"] not in ("file_name", "file_path"), "C", cached.first_seen if cached else None)
+                v = osint.verdict(m["type"], rep, listed and m["type"] not in ("file_name", "file_path"), "C", fs, expiry,
+                                  known_good=bool(good))
             role = "; ".join(sorted(m["roles"]))
+            exp = osint.expires_at(m["type"], fs, expiry)
             out.append({
                 "type": m["type"], "value": defang(m["value"], m["type"]), "role": role,
                 "context": m["contexts"][0] if m["contexts"] else role,
                 "contexts": m["contexts"], "source_ids": sorted(m["source_ids"]), "reputation": rep,
                 "reputation_summary": osint.reputation_summary(rep), "verdict": v,
+                "intel_first_seen": fs.isoformat() if fs else None, "expires_at": exp.isoformat() if exp else None,
+                **({"known_good": good} if good else {}),
             })
     counts = {}
     for i in out:
@@ -720,11 +1080,30 @@ def stage_iocs(ctx: Ctx):
 
 # --------------------------------------------------------------------------- 9. Report build
 
+def enrich_vulnerabilities(ctx: Ctx, ent_vulns: list[dict]) -> list[dict]:
+    """Deterministic post-check (spec section 12): look every CVE up in NVD, CISA KEV and EPSS.
+
+    Runs before the report transaction opens (NVD is rate limited). Hunter-edited vulnerabilities are enriched in
+    place of the generated ones. Network failures only log a warning and keep the existing values.
+    """
+    with SessionLocal() as db:
+        prev = db.get(Research, ctx.research_id).record or {}
+    base = prev.get("vulnerabilities", []) if "vulnerabilities" in prev.get("_edited", []) else ent_vulns
+    base = [{"kev_added": None, "epss": None, **v} for v in base]
+    try:
+        out, _ = vulns.enrich(base, logf=ctx.log)
+    except Exception as e:  # noqa: BLE001 - enrichment never fails a run
+        ctx.log(f"CVE enrichment skipped: {e}", "warn")
+        out = base
+    return out
+
+
 def stage_report(ctx: Ctx):
     arts = ctx.artifacts
     syn = arts["synthesis"]
     nar, ent = syn["narrative"], syn["entities"]
     ext = arts["extraction"]["results"]
+    enriched_vulns = enrich_vulnerabilities(ctx, ent["vulnerabilities"])
     with SessionLocal() as db:
         r = db.get(Research, ctx.research_id)
         prev = r.record or {}
@@ -768,12 +1147,7 @@ def stage_report(ctx: Ctx):
             "ttp_queries": [q["id"] for q in queries if q["type"] == "ttp"],
             "platforms": ctx.config.get("platforms", []), "lookback_days": ctx.config.get("lookback_days", 30),
         }
-        log_sources_required = []
-        for q in queries:
-            for cat in q.get("data_sources", []):
-                row = {"data_source": cat, "label": detection.CATEGORIES.get(cat, cat), **detection.LOG_SOURCES.get(cat, {})}
-                if row not in log_sources_required:
-                    log_sources_required.append(row)
+        log_sources_req = log_sources_required(queries)
 
         workflow = []
         for sid, label in STAGES:
@@ -796,14 +1170,14 @@ def stage_report(ctx: Ctx):
             "patching_insufficient": nar.get("patching_insufficient", False),
             "recommendations": nar["recommendations"], "results": [], "mitre": arts["attack"]["mitre"],
             "tools_used": tools_used, "workflow": workflow, "hunts": hunts, "industries": nar["industries"],
-            "vulnerabilities": [{**v, "kev_added": None, "epss": None} for v in ent["vulnerabilities"]],
+            "vulnerabilities": enriched_vulns,
             "threat_actors": ent["threat_actors"], "malware_tools": ent["malware_tools"], "attack_paths": attack_paths,
             "ioas": [{**x, "id": f"IOA-{i}"} for i, x in enumerate(ent["ioas"], 1)],
             "iocs": arts.get("iocs", {}).get("iocs", []),
-            "detection_opportunities": opps, "log_sources_required": log_sources_required,
+            "detection_opportunities": opps, "log_sources_required": log_sources_req,
             "timeline": nar["timeline"], "sources": sources, "claims": nar["claims"], "conflicts": nar["conflicts"],
             "geography": nar["geography"], "study": nar["study"], "tags": [], "related_research_ids": prev.get("related_research_ids", []),
-            "affected_technologies": sorted({p for v in ent["vulnerabilities"] for p in v.get("affected_products", [])}),
+            "affected_technologies": sorted({p for v in enriched_vulns for p in v.get("affected_products", [])}),
             "run": {"id": ctx.run_id, "mode": ctx.mode, "tokens": run.cost_tokens},
             "review": {k: "generated" for k in ("executive_summary", "impact", "recommendations", "mitre", "hunts", "iocs", "study", "attack_paths")},
             "_edited": sorted(edited),
@@ -813,6 +1187,18 @@ def stage_report(ctx: Ctx):
             if k in prev:
                 record[k] = prev[k]
                 record["review"][k] = "edited"
+        record["vulnerabilities"] = enriched_vulns  # already built from the hunter's edits when there are any
+
+        # Analyst IoC decisions (false positive / benign / excluded) survive re-runs. Apply them and the library
+        # overrides, then drop from the retro-hunts anything now hidden that query generation could not know about
+        # (it runs in parallel with enrichment); only the IOC-* groups are touched.
+        if prev.get("ioc_review"):
+            record["ioc_review"] = prev["ioc_review"]
+        apply_ioc_review(record, library_overrides_by_key(db))
+        changed = regenerate_ioc_queries(db, record)
+        if changed:
+            ctx.log("Retro-hunt queries regenerated after IoC verdicts: " +
+                    ", ".join(f"{c['group']} {c['before']}→{c['after']}" for c in changed))
 
         applic, gaps = [], []
         for wid in ctx.config.get("workspace_ids", []):
@@ -836,6 +1222,8 @@ def stage_report(ctx: Ctx):
         first = not prev
         r.workspace_ids = ctx.config.get("workspace_ids", r.workspace_ids)
         save_record(db, r, record, r.created_by, "Run completed" if first else "Pipeline re-run", bump=not first)
+        db.flush()
+        vulns.update_library(db, record["vulnerabilities"])
         ensure_results(db, r)
         # Mirror results into the record for exports.
         from ..models import Result
@@ -864,6 +1252,9 @@ def stage_export(ctx: Ctx):
     disputed = [c for c in rec.get("conflicts", []) if c.get("status") == "disputed"]
     if disputed:
         issues.append(f"{len(disputed)} disputed claim(s) need a reviewer decision")
+    bad_cves = [v.get("cve") for v in rec.get("vulnerabilities", []) if v.get("validation") in ("not_found", "rejected", "invalid_format")]
+    if bad_cves:
+        issues.append(f"CVE id(s) not found or rejected in NVD: {', '.join(bad_cves)}")
     lint = [q for q in rec.get("hunts", {}).get("queries", []) if q.get("lint")]
     if lint:
         issues.append(f"{len(lint)} quer{'y' if len(lint) == 1 else 'ies'} failed syntax lint")

@@ -20,7 +20,8 @@ export default function WorkspaceEdit() {
   const isNew = id === "new";
   const router = useRouter();
   const toast = useToast();
-  const { workspaces, meta, reloadWorkspaces } = useApp();
+  const { user, workspaces, meta, reloadWorkspaces } = useApp();
+  const canEdit = user?.role === "lead" || user?.role === "admin";
   const existing = workspaces.find((w) => w.id === id);
   const [f, setF] = useState<Omit<Workspace, "id">>(EMPTY);
   const [mappings, setMappings] = useState<{ platform: string; from: string; to: string }[]>([]);
@@ -67,7 +68,8 @@ export default function WorkspaceEdit() {
     <Page className="pb-28">
       <PageHeader crumbs={[{ label: "Settings", href: "/settings" }, { label: "Workspaces", href: "/settings/workspaces" }, { label: isNew ? "New" : f.name }]}
         title={isNew ? "New workspace" : f.name || "Workspace"} />
-      <div className="max-w-form space-y-8">
+      {!canEdit && <Alert tone="info" title="Read only">Only leads and admins can change client workspaces. Switch user from the account menu to try it.</Alert>}
+      <fieldset disabled={!canEdit} className="max-w-form min-w-0 space-y-8">
         <section className="space-y-5 rounded-md border border-line bg-surface p-6">
           <h3 className="text-h3 font-semibold">Client</h3>
           <div className="grid gap-5 sm:grid-cols-2">
@@ -147,11 +149,11 @@ export default function WorkspaceEdit() {
             </div>
           )}
         </section>
-      </div>
+      </fieldset>
       <div className="fixed right-0 bottom-0 left-0 z-[150] border-t border-line bg-surface sm:left-16 lg:left-[var(--sb,240px)]">
         <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-end gap-3 px-4 md:px-6">
           <Button onClick={() => router.push("/settings/workspaces")}>Cancel</Button>
-          <Button variant="primary" size="lg" loading={saving} onClick={save}>Save workspace</Button>
+          <Button variant="primary" size="lg" loading={saving} disabled={!canEdit} disabledReason="Only leads and admins can change workspaces" onClick={save}>Save workspace</Button>
         </div>
       </div>
     </Page>
